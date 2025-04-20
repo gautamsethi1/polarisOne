@@ -1,0 +1,25 @@
+{
+  "configurations" : [
+    {
+      "id" : "637A2024-E912-4717-9DEF-739426C12D6F",
+      "name" : "Test Scheme Action",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:polarisOne.xcodeproj",
+        "identifier" : "B081C60C2DB4B61A00B74B7A",
+        "name" : "polarisOneTests"
+      }
+    }
+  ],
+  "version" : 1
+}

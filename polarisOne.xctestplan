@@ -1,0 +1,37 @@
+{
+  "configurations" : [
+    {
+      "id" : "E363F960-3C0B-4B5E-966D-6330BC008B68",
+      "name" : "Test Scheme Action",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:polarisOne.xcodeproj",
+      "identifier" : "B081C5FF2DB4B61600B74B7A",
+      "name" : "polarisOne"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:polarisOne.xcodeproj",
+        "identifier" : "B081C60C2DB4B61A00B74B7A",
+        "name" : "polarisOneTests"
+      }
+    },
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:polarisOne.xcodeproj",
+        "identifier" : "B081C6162DB4B61A00B74B7A",
+        "name" : "polarisOneUITests"
+      }
+    }
+  ],
+  "version" : 1
+}
