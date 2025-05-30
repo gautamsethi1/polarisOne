@@ -40,73 +40,156 @@ struct ARKitCameraApp: App {
   }
 }
 
-
 // MARK: - Potential File: ViewModels/ARViewModel.swift
 // MARK: – ObservableObject bridging ARSession → SwiftUI
 final class ARViewModel: ObservableObject {
   @Published var shareURL: URL?
-  @Published var distanceToPerson: String = "Looking for subjects..." // e.g., "1.5 m"
+  @Published var distanceToPerson: String = "Looking for subjects..."
   @Published var detectedSubjectCount: Int = 0
 
   @Published var cameraHeightRelativeToEyes: String = "Eyes: N/A"
-  @Published var generalCameraHeight: String = "Cam Height: N/A" // e.g., "Cam Height: 0.9 m (Floor)"
+  @Published var generalCameraHeight: String = "Cam Height: N/A"
   @Published var visibleBodyPartsInfo: String = "Visible Parts: N/A"
   @Published var bodyTrackingHint: String = ""
   @Published var isBodyTrackingActive: Bool = false
-   
-  @Published var isCapturing: Bool = false // For existing analysis
-  @Published var showResponses: Bool = false // For text responses from any service
 
-  // --- PROPERTIES FOR IMAGE GENERATION ---
-  @Published var referencePhoto: UIImage? = UIImage(named: "reference_placeholder") // Add "reference_placeholder.png" to Assets.xcassets
+  @Published var isCapturing: Bool = false
+  @Published var showResponses: Bool = false
+
+  @Published var selectedReferenceImage: ReferenceImage? = nil
   @Published var generatedImage: UIImage?
-  @Published var isGeneratingPhoto: Bool = false // Loading state for Flash 2.0 call
+  @Published var isGeneratingPhoto: Bool = false
 
-  // --- PROPERTIES FOR GENERIC TEXT GENERATION ---
-  @Published var generatedTextFromGemini: String?
-  @Published var isGeneratingGenericText: Bool = false
-  @Published var genericTextError: String?
+  // --- Enhanced Calibration State ---
+  @Published var isCalibratingHeight: Bool = false
+  @Published var calibrationInstruction: String = "Tap 'Start Calibration' for better height accuracy."
+  @Published var triggerFloorMeasurement: Bool = false
 
-  // Calibration state
-  var calibratedCameraHeight: Float = 0.0
+  var calibratedFloorY: Float? = nil
   var isCalibrated: Bool = false
-  var distanceCalibrationFactor: Float = 1.0
   var heightMeasurements: [Float] = []
-  var distanceMeasurements: [Float] = []
   let maxMeasurements = 5
   @Published var calibrationResetTrigger: Bool = false
 
-  func resetCalibration() {
-    calibratedCameraHeight = 0.0
+  // --- Automatic Reset Failsafe ---
+  @Published var automaticResetCooldownActive: Bool = false
+  private var automaticResetTimer: Timer?
+
+  func startHeightCalibration() {
+    automaticResetTimer?.invalidate()
+    automaticResetCooldownActive = false
     isCalibrated = false
+    calibratedFloorY = nil
+    isCalibratingHeight = true
     heightMeasurements.removeAll()
-    distanceMeasurements.removeAll()
-    calibrationResetTrigger.toggle() // Notify Coordinator to reset its state
+    calibrationInstruction = "Point camera at floor. Tap 'Measure Floor' \(maxMeasurements) times."
+    bodyTrackingHint = ""
+    generalCameraHeight = "Cam Height: Calibrating..."
+  }
+
+  func requestFloorMeasurement() {
+    guard isCalibratingHeight else { return }
+    calibrationInstruction = "Getting measurement... Hold steady."
+    triggerFloorMeasurement = true
+  }
+
+  func processTakenFloorMeasurement(cameraY: Float) {
+    guard isCalibratingHeight else { return }
+    heightMeasurements.append(cameraY)
+    let measurementsTaken = heightMeasurements.count
+    if measurementsTaken < maxMeasurements {
+      calibrationInstruction = "Measurement \(measurementsTaken)/\(maxMeasurements) taken. Tap 'Measure Floor' again."
+    } else {
+      calibratedFloorY = heightMeasurements.reduce(0, +) / Float(heightMeasurements.count)
+      isCalibratingHeight = false
+      isCalibrated = true
+      calibrationInstruction = "Floor calibrated at Y: \(String(format: "%.2f", calibratedFloorY!))m. Height is now relative to this."
+      bodyTrackingHint = "Calibration Complete!"
+    }
+  }
+
+  func resetCalibration(triggeredAutomatically: Bool = false) {
+    isCalibratingHeight = false
+    heightMeasurements.removeAll()
+    isCalibrated = false
+    calibratedFloorY = nil
+    if triggeredAutomatically {
+        calibrationInstruction = "Height anomaly detected. Calibration reset. Please recalibrate floor."
+        bodyTrackingHint = "AUTO-RESET: Height issue. Recalibrate floor."
+        generalCameraHeight = "Cam Height: N/A (Auto-Reset)"
+        automaticResetCooldownActive = true
+        automaticResetTimer?.invalidate()
+        automaticResetTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
+            self?.automaticResetCooldownActive = false
+            if !(self?.isCalibratingHeight ?? false) && !(self?.isCalibrated ?? false) {
+                 self?.calibrationInstruction = "Tap 'Start Calibration' for better height accuracy."
+            }
+            print("Automatic reset cooldown finished.")
+        }
+    } else {
+        automaticResetTimer?.invalidate()
+        automaticResetCooldownActive = false
+        calibrationInstruction = "Calibration Reset. Tap 'Start Calibration' for accuracy."
+        bodyTrackingHint = "Calibration has been reset manually."
+        generalCameraHeight = "Cam Height: N/A (Recalibrate)"
+    }
+    calibrationResetTrigger.toggle()
+  }
+
+  private func getFinalCameraHeightForPrompt() -> (stringValue: String, numericValue: Double?) {
+      var cameraHeightStringValue: String = "N/A"
+      var numericHeightValue: Double? = nil
+      let fullHeightString = generalCameraHeight
+      if fullHeightString.lowercased().contains("calibrating") || fullHeightString.lowercased().contains("auto-reset") {
+          cameraHeightStringValue = "Calibrating/Resetting"
+      } else if fullHeightString.lowercased().contains("n/a") {
+          cameraHeightStringValue = "N/A"
+      } else {
+          let components = fullHeightString.components(separatedBy: .whitespaces)
+          if components.count >= 3 {
+              let heightPart = components[2]
+              let numericString = heightPart.replacingOccurrences(of: "m", with: "")
+              if let numValue = Double(numericString) {
+                  cameraHeightStringValue = numericString
+                  numericHeightValue = numValue
+              }
+          }
+      }
+      var finalPromptString = cameraHeightStringValue
+      if let numHeight = numericHeightValue, numHeight < -0.05 {
+          if generalCameraHeight.lowercased().contains("below calib. floor") || generalCameraHeight.lowercased().contains("low?") {
+              finalPromptString = "\(cameraHeightStringValue)m (potentially low)"
+          } else if numHeight < -0.19 && (generalCameraHeight.lowercased().contains("origin") || !isCalibrated) {
+              finalPromptString = "approx. 0m (origin likely high or detection issue)"
+          } else {
+              finalPromptString = "\(cameraHeightStringValue)m"
+          }
+      } else if cameraHeightStringValue == "N/A" || cameraHeightStringValue == "Calibrating/Resetting" {
+          finalPromptString = "unknown (AR not ready/calibrating/reset)"
+      } else if numericHeightValue != nil {
+           finalPromptString = "\(cameraHeightStringValue)m"
+      }
+      return (finalPromptString, numericHeightValue)
   }
 
   func captureAndAnalyze() {
     guard let arView = ARMeshExporter.arView else { return }
     isCapturing = true
     let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
-    let image = renderer.image { ctx in
+    let currentARImage = renderer.image { ctx in
       arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
     }
+
+    let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
     let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
-    var cameraHeightStringValue: String = "N/A"
-    let heightComponents = generalCameraHeight.components(separatedBy: .whitespaces)
-    if heightComponents.count > 2 {
-        let rawHeightValue = heightComponents[2].replacingOccurrences(of: "m", with: "")
-        if Double(rawHeightValue) != nil {
-            cameraHeightStringValue = rawHeightValue
-        }
-    }
+
     let prompt =
     """
-    Act like an expert ARKit scene analyst. I will provide a photo of the current AR scene, and some measured values about the subject and camera. Please provide a concise analysis (≤80 words) of the scene, including any suggestions for improving the photo or AR experience. List any detected issues or tips for better results.\n\nScene metrics:\n- Subject distance: \(distanceStringValue) m\n- Camera height: \(cameraHeightStringValue) m\n- Height relative to eyes: \(cameraHeightRelativeToEyes)\n- Visible body parts: \(visibleBodyPartsInfo)\n- Detected subject count: \(detectedSubjectCount)\n
+    Act like an expert ARKit scene analyst. I will provide a photo of the current AR scene (it will be sent as the first image, and also duplicated as the second image in the payload, please use the first one), and some measured values about the subject and camera. Please provide a concise analysis (≤80 words) of the scene, including any suggestions for improving the photo or AR experience. List any detected issues or tips for better results.\n\nScene metrics:\n- Subject distance: \(distanceStringValue) m\n- Camera height: \(finalCameraHeightForPrompt)\n- Height relative to eyes: \(cameraHeightRelativeToEyes)\n- Visible body parts: \(visibleBodyPartsInfo)\n- Detected subject count: \(detectedSubjectCount)\n
     """
     let currentMetrics: [String: String] = [
         "distance_to_person_meters": distanceStringValue,
-        "camera_height_meters": cameraHeightStringValue,
+        "camera_height_meters": finalCameraHeightForPrompt,
         "camera_height_raw_string": generalCameraHeight,
         "camera_height_relative_to_eyes": cameraHeightRelativeToEyes,
         "visible_body_parts": visibleBodyPartsInfo,
@@ -115,8 +198,8 @@ final class ARViewModel: ObservableObject {
     Task {
       do {
         let (directivesText, _) = try await APIService.shared.sendImageGenerationRequest(
-          referenceImage: image, // Use the same image for both reference and current
-          currentImage: image,
+          referenceImage: currentARImage,
+          currentImage: currentARImage,
           prompt: prompt,
           additionalMetrics: currentMetrics
         )
@@ -143,54 +226,93 @@ final class ARViewModel: ObservableObject {
       self.bodyTrackingHint = "AR system not ready."
       return
     }
-    guard let refPhoto = referencePhoto else {
+    guard let refImageContainer = selectedReferenceImage, let photo1 = refImageContainer.image else {
         print("Reference photo (Photo 1) is missing.")
         self.bodyTrackingHint = "Please select a reference photo first."
         return
     }
+
     isGeneratingPhoto = true
-    self.generatedImage = nil
+
     let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
     let photo2 = renderer.image { ctx in
       arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
     }
+
+    let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
     let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
-    var cameraHeightStringValue: String = "N/A"
-    let heightComponents = generalCameraHeight.components(separatedBy: .whitespaces)
-    if heightComponents.count > 2 {
-        let rawHeightValue = heightComponents[2].replacingOccurrences(of: "m", with: "")
-        if Double(rawHeightValue) != nil {
-            cameraHeightStringValue = rawHeightValue
-        }
-    }
-    let prompt = """
-    Act like a photographer who is helping me take a better photo of myself with my iphone. I will provide 2 photos, the first photo is the reference photo, and the second represents what the current photo looks like:
-    I want Photo 2 to resemble Photo 1, it does not need to be exact, but try to show the subject with a similar perspective & angle.
-    Reply in ≤80 words, listing exactly six directives—one per DOF—plus an optional better‑angle tip. For each:
-    • Left/Right (x) – "Move ___ m left/right or 'no movement'"
-    • Up/Down (y) – "Move ___ m up/down or 'no movement'"
-    • Forward/Back (z) – "Move ___ m forward/back or 'no movement'"
-    • Yaw (pan) – "Turn ___ degrees left/right or 'no rotation'"
-    • Pitch (tilt) – "Tilt ___ degrees up/down or 'no tilt'"
-    • Roll – "Roll ___ degrees clockwise/counter-clockwise or 'no roll'"
-    Use precise numbers (meters & degrees).
-    Scenario:
-    Photo 1: subject approximately 0.8-0.9 m from camera, camera 0.9 m high.
-    Photo 2: subject \(distanceStringValue) m from camera, camera \(cameraHeightStringValue) m high.
-    I want Photo 2 to resemble Photo 1, it does not need to be exact, but try to show the subject with a similar perspective & angle.
+
+    // **FIXED PART 1: Directly access metadata, no 'if let' needed here for metadata itself**
+    let refMeta = refImageContainer.metadata // refImageContainer is already unwrapped
+    
+    let distCam = refMeta.distanceFromCamera.isEmpty ? "N/A" : "\(refMeta.distanceFromCamera)m"
+    let camHeight = refMeta.cameraHeight.isEmpty ? "N/A" : "\(refMeta.cameraHeight)m"
+    let belowEyeline = refMeta.distanceBelowEyeline.isEmpty ? "N/A" : "\(refMeta.distanceBelowEyeline)m (camera below subject's eyes)"
+    
+    let photo1Details = """
+    - Subject distance from camera: \(distCam)
+    - Camera height: \(camHeight)
+    - Camera position relative to subject's eyeline: \(belowEyeline)
     """
+
+    let photo2Details = """
+    - Subject distance from camera: \(distanceStringValue.isEmpty ? "N/A" : "\(distanceStringValue)m")
+    - Camera height: \(finalCameraHeightForPrompt)
+    - Camera height relative to subject's eyes: \(cameraHeightRelativeToEyes)
+    - Visible body parts: \(visibleBodyPartsInfo)
+    - Detected subject count: \(detectedSubjectCount)
+    """
+
+    let prompt = """
+    You are an expert photography assistant. Your goal is to help me adjust my iPhone camera position and angle to make the live camera view (Photo 2) look as close as possible to a reference image (Photo 1).
+
+    I will provide two images:
+    1. Photo 1: The reference image I want to emulate. (This will be the first image in the payload)
+    2. Photo 2: The current live view from my iPhone camera. (This will be the second image in the payload)
+
+    And I'll provide some technical details for both photos.
+
+    Reference Photo Details (Photo 1):
+    \(photo1Details)
+
+    Current Scene Details (Photo 2):
+    \(photo2Details)
+
+    Based on these two images and their details, provide very concise and precise directives (MAX 80 words total for all directives) to adjust my iPhone (Photo 2) to better match Photo 1's perspective, angle, and subject framing.
+    Output exactly six directives, one for each degree of freedom (DOF). If no change is needed for a DOF, state "no change" or "minimal change".
+    Use numeric values in meters (m) for translations and degrees (°) for rotations. Be specific.
+
+    Directives Format:
+    • X (Left/Right): Move ___ m left/right (or 'no change').
+    • Y (Up/Down): Move ___ m up/down (or 'no change').
+    • Z (Forward/Back): Move ___ m forward/back (or 'no change').
+    • Yaw (Pan Left/Right): Turn ___° left/right (or 'no change').
+    • Pitch (Tilt Up/Down): Tilt ___° up/down (or 'no change').
+    • Roll (Rotate CW/CCW): Roll ___° clockwise/counter-clockwise (or 'no change').
+
+    Optional: If a significant overall angle change is needed (e.g., from frontal to profile), add a brief "Angle Tip:" after the six directives.
+    Example response:
+    X (Left/Right): Move 0.1m right.
+    Y (Up/Down): Move 0.05m up.
+    Z (Forward/Back): Move 0.2m back.
+    Yaw (Pan Left/Right): Turn 5° left.
+    Pitch (Tilt Up/Down): Tilt 2° down.
+    Roll (Rotate CW/CCW): no change.
+    """
+
     let currentMetrics: [String: String] = [
         "distance_to_person_meters": distanceStringValue,
-        "camera_height_meters": cameraHeightStringValue,
+        "camera_height_meters": finalCameraHeightForPrompt,
         "camera_height_raw_string": generalCameraHeight,
         "camera_height_relative_to_eyes": cameraHeightRelativeToEyes,
         "visible_body_parts": visibleBodyPartsInfo,
         "detected_subject_count": "\(detectedSubjectCount)"
     ]
+
     Task {
         do {
-            let (directivesText, returnedImage) = try await APIService.shared.sendImageGenerationRequest(
-                referenceImage: refPhoto,
+            let (directivesText, _) = try await APIService.shared.sendImageGenerationRequest(
+                referenceImage: photo1,
                 currentImage: photo2,
                 prompt: prompt,
                 additionalMetrics: currentMetrics
@@ -199,40 +321,15 @@ final class ARViewModel: ObservableObject {
             await MainActor.run {
                 let responsesVM = ResponsesViewModel()
                 responsesVM.saveResponse(apiResponse)
-                self.generatedImage = returnedImage
+                self.bodyTrackingHint = "Directives: \(directivesText.prefix(60))... (See Responses)"
                 self.isGeneratingPhoto = false
                 self.showResponses = true
             }
         } catch {
-            print("Error sending image generation request: \(error.localizedDescription)")
+            print("Error sending image guidance request: \(error.localizedDescription)")
             await MainActor.run {
                 self.isGeneratingPhoto = false
-                self.bodyTrackingHint = "Photo Gen failed: \(error.localizedDescription.prefix(50))..."
-            }
-        }
-    }
-  }
-
-  func generateGenericText(userPrompt: String) {
-    isGeneratingGenericText = true
-    genericTextError = nil
-    generatedTextFromGemini = nil
-    Task {
-        do {
-            let responseText = try await APIService.shared.generateTextWithGeminiFlash(prompt: userPrompt)
-            await MainActor.run {
-                self.generatedTextFromGemini = responseText
-                self.isGeneratingGenericText = false
-                let apiResponse = APIResponse(response: "Prompt: \"\(userPrompt)\"\n\nGemini: \(responseText)")
-                let responsesVM = ResponsesViewModel()
-                responsesVM.saveResponse(apiResponse)
-                self.showResponses = true
-            }
-        } catch {
-            print("Error generating generic text with Gemini: \(error.localizedDescription)")
-            await MainActor.run {
-                self.genericTextError = "Gemini Text Failed: \(error.localizedDescription.prefix(100))"
-                self.isGeneratingGenericText = false
+                self.bodyTrackingHint = "Guidance Gen failed: \(error.localizedDescription.prefix(50))..."
             }
         }
     }
@@ -246,14 +343,12 @@ struct ContentView: View {
   @StateObject private var refVM = ReferenceImageViewModel()
   @StateObject private var boxVM = BoxPlacementViewModel()
 
-  @State private var genericPromptInput: String = "Explain ARKit body tracking in simple terms."
-
   var body: some View {
     ZStack(alignment: .topLeading) {
       ARViewContainer(viewModel: vm, boxVM: boxVM).ignoresSafeArea()
 
       VStack(alignment: .leading, spacing: 8) {
-        if let ref = refVM.selected, let img = ref.image {
+        if let refContainer = vm.selectedReferenceImage, let img = refContainer.image {
           Button(action: { refVM.showSelector = true }) {
             Image(uiImage: img)
               .resizable().scaledToFit().frame(width: 120, height: 120)
@@ -272,31 +367,52 @@ struct ContentView: View {
         Button(action: { boxVM.showBoxInput = true }) {
             Label("Box Placement", systemImage: "cube").font(.caption).padding(6).background(Color(.systemGray6)).cornerRadius(8)
         }.padding(.bottom, 8)
-        Button(action: { vm.resetCalibration() }) {
-            Label("Reset Calibration", systemImage: "arrow.counterclockwise").font(.caption).padding(6).background(Color(.systemGray6)).cornerRadius(8)
-        }.padding(.bottom, 8)
         
+        VStack(alignment: .leading, spacing: 5) {
+            Button(action: { vm.resetCalibration(triggeredAutomatically: false) }) {
+                Label("Reset Calibration", systemImage: "arrow.counterclockwise")
+                    .font(.caption).padding(6).background(Color(.systemGray5)).cornerRadius(8)
+            }
+            Text(vm.calibrationInstruction)
+                .font(.caption).lineLimit(nil).fixedSize(horizontal: false, vertical: true).padding(5)
+                .background(
+                    Group {
+                        if vm.calibrationInstruction.lowercased().contains("anomaly") || vm.calibrationInstruction.lowercased().contains("auto-reset") { Color.orange.opacity(0.3) }
+                        else if vm.isCalibratingHeight || (!vm.isCalibrated && !vm.calibrationInstruction.lowercased().contains("complete")) { Color.yellow.opacity(0.3) }
+                        else if vm.calibrationInstruction.lowercased().contains("complete") || vm.calibrationInstruction.lowercased().contains("calibrated at") { Color.green.opacity(0.2) }
+                        else { Color.clear }
+                    }).cornerRadius(5)
+            if vm.isCalibratingHeight {
+                Button(action: { vm.requestFloorMeasurement() }) {
+                    Label("Measure Floor (\(vm.heightMeasurements.count)/\(vm.maxMeasurements))", systemImage: "ruler.fill")
+                }.font(.caption).padding(6).background(Color.blue.opacity(0.3)).cornerRadius(8)
+                .disabled(vm.heightMeasurements.count >= vm.maxMeasurements)
+            } else if !vm.isCalibrated || vm.automaticResetCooldownActive {
+                Button(action: { vm.startHeightCalibration() }) {
+                    Label("Start Floor Calibration", systemImage: "target")
+                }.font(.caption).padding(6).background(Color.green.opacity(0.3)).cornerRadius(8)
+            }
+        }.padding(.bottom, 8)
+
         if !vm.bodyTrackingHint.isEmpty {
-          Text(vm.bodyTrackingHint).padding(.vertical, 5).padding(.horizontal, 10).background(.ultraThinMaterial).cornerRadius(8).foregroundColor(.red).font(.caption)
+          Text(vm.bodyTrackingHint)
+            .padding(.vertical, 5).padding(.horizontal, 10)
+            .background(.ultraThinMaterial).cornerRadius(8)
+            .foregroundColor(
+                vm.bodyTrackingHint.lowercased().contains("error") ||
+                vm.bodyTrackingHint.lowercased().contains("failed") ||
+                vm.bodyTrackingHint.lowercased().contains("auto-reset") ? .red : .primary
+            ).font(.caption)
         }
         Text("Subjects: \(vm.detectedSubjectCount)").infoStyle()
         Text(vm.distanceToPerson).infoStyle()
         Text(vm.cameraHeightRelativeToEyes).infoStyle()
         Text(vm.generalCameraHeight).infoStyle()
         Text(vm.visibleBodyPartsInfo).infoStyle().lineLimit(3)
-
-        // --- UI FOR GENERIC TEXT GENERATION STATUS ---
-        if vm.isGeneratingGenericText {
-            HStack { Text("Asking Gemini..."); ProgressView() }.infoStyle()
-        }
-        if let geminiError = vm.genericTextError {
-            Text(geminiError).foregroundColor(.red).font(.caption2).padding(4).background(Material.regular).cornerRadius(6)
-        }
-        Spacer()
       }
       .padding()
 
-      VStack { // Bottom aligned content
+      VStack {
         Spacer()
         if let generatedImg = vm.generatedImage {
             Image(uiImage: generatedImg)
@@ -305,44 +421,28 @@ struct ContentView: View {
                 .padding(.bottom, 5)
         }
 
-        // --- Generic Text Generation Controls ---
-        VStack(spacing: 5) {
-            TextField("Enter prompt for Gemini...", text: $genericPromptInput, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .frame(minHeight: 40).lineLimit(1...3)
-                .disabled(vm.isGeneratingGenericText || vm.isCapturing || vm.isGeneratingPhoto)
-            Button(action: {
-                vm.generateGenericText(userPrompt: genericPromptInput.isEmpty ? "Explain ARKit in simple terms." : genericPromptInput)
-            }) {
-                Label("Ask Gemini Text", systemImage: "bubble.left.and.bubble.right.fill")
-                    .font(.system(size: 16, weight: .semibold))
-                    .padding(.horizontal, 10).padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-            }
-            .disabled(vm.isGeneratingGenericText || vm.isCapturing || vm.isGeneratingPhoto)
-            .opacity((vm.isGeneratingGenericText || vm.isCapturing || vm.isGeneratingPhoto) ? 0.5 : 1.0)
-        }
-        .padding(.horizontal)
-        .padding(.bottom, 10)
-
         HStack(spacing: 15) {
           Spacer()
           Button(action: { vm.captureAndAnalyze() }) {
             Image(systemName: "wand.and.stars").font(.system(size: 22, weight: .semibold))
               .padding().background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Analyze Scene (Gemini)")
           }
-          .disabled(vm.isCapturing || vm.isGeneratingPhoto || vm.isGeneratingGenericText)
-          .opacity((vm.isCapturing || vm.isGeneratingPhoto || vm.isGeneratingGenericText) ? 0.5 : 1.0)
+          .disabled(vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight)
+          .opacity((vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight) ? 0.5 : 1.0)
            
           Button(action: {
-            if vm.referencePhoto == nil { vm.bodyTrackingHint = "Error: Set reference photo first."; return }
+            if vm.selectedReferenceImage == nil { vm.bodyTrackingHint = "Error: Set reference photo first."; return }
+            if !vm.isCalibrated && !vm.generalCameraHeight.lowercased().contains("floor") && !vm.generalCameraHeight.lowercased().contains("plane") {
+                vm.bodyTrackingHint = "Calibrate floor first for accurate photo guidance."
+                return
+            }
             vm.generateImprovedPhoto()
           }) {
             Image(systemName: "camera.filters").font(.system(size: 22, weight: .semibold))
-              .padding().background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Generate Improved Photo")
+              .padding().background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Get Photo Guidance")
           }
-          .disabled(vm.isCapturing || vm.isGeneratingPhoto || !vm.isBodyTrackingActive || vm.detectedSubjectCount == 0 || vm.referencePhoto == nil || vm.isGeneratingGenericText)
-          .opacity((vm.isCapturing || vm.isGeneratingPhoto || !vm.isBodyTrackingActive || vm.detectedSubjectCount == 0 || vm.referencePhoto == nil || vm.isGeneratingGenericText) ? 0.5 : 1.0)
+          .disabled(vm.isCapturing || vm.isGeneratingPhoto || !vm.isBodyTrackingActive || vm.detectedSubjectCount == 0 || vm.selectedReferenceImage == nil || vm.isCalibratingHeight)
+          .opacity((vm.isCapturing || vm.isGeneratingPhoto || !vm.isBodyTrackingActive || vm.detectedSubjectCount == 0 || vm.selectedReferenceImage == nil || vm.isCalibratingHeight) ? 0.5 : 1.0)
            
           Button(action: {
             if !vm.isBodyTrackingActive { vm.shareURL = ARMeshExporter.exportCurrentScene() }
@@ -350,8 +450,8 @@ struct ContentView: View {
             Image(systemName: "square.and.arrow.up").font(.system(size: 22, weight: .semibold))
               .padding().background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Export Scene")
           }
-          .disabled(vm.isBodyTrackingActive || !ARMeshExporter.hasMesh || vm.isCapturing || vm.isGeneratingPhoto || vm.isGeneratingGenericText)
-          .opacity((vm.isBodyTrackingActive || !ARMeshExporter.hasMesh || vm.isCapturing || vm.isGeneratingPhoto || vm.isGeneratingGenericText) ? 0.5 : 1.0)
+          .disabled(vm.isBodyTrackingActive || !ARMeshExporter.hasMesh || vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight)
+          .opacity((vm.isBodyTrackingActive || !ARMeshExporter.hasMesh || vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight) ? 0.5 : 1.0)
           Spacer()
         }
         .padding(.bottom, 10)
@@ -361,32 +461,37 @@ struct ContentView: View {
     .sheet(item: $vm.shareURL) { url in ActivityView(activityItems: [url]) }
     .sheet(isPresented: $vm.showResponses) { ResponsesView() }
     .sheet(isPresented: $refVM.showSelector) {
-      ReferenceImageSelector(vm: refVM).onDisappear { refVM.load() }
+      ReferenceImageSelector(vm: refVM)
     }
     .sheet(isPresented: $boxVM.showBoxInput) {
       BoxPlacementPanel(vm: boxVM, onAdd: { _ in }, onDelete: { _ in })
     }
+    .onChange(of: refVM.selected) { newValue in
+        vm.selectedReferenceImage = newValue
+        if newValue == nil && !vm.isGeneratingPhoto && !vm.isCapturing {
+            vm.bodyTrackingHint = "Tip: Set a reference photo for image generation."
+        }
+    }
     .onAppear {
       if !ARBodyTrackingConfiguration.isSupported { vm.bodyTrackingHint = "ARBodyTracking not supported." }
       
-      // --- CONFIGURE APIService ---
-      // For your original analysis service (if you have one separate from Gemini)
       APIService.shared.configure(
-        apiKey: "YOUR_ANALYSIS_API_KEY_IF_ANY", // Replace or leave blank if not used
-        apiURL: "YOUR_ANALYSIS_API_URL_IF_ANY"    // Replace or leave blank if not used
+        apiKey: "YOUR_ANALYSIS_API_KEY_IF_ANY",
+
+
+
       )
       
-      // For Gemini Flash (used for both image directives and generic text)
-      // Load API key from .env file
       let geminiAPIKey = EnvHelper.value(for: "GEMINI_API_KEY")
       let geminiBaseURLForFlashModel = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
       
       APIService.shared.configureFlash(
-        apiKey: geminiAPIKey, // Pass the key string
-        apiURL: geminiBaseURLForFlashModel // Pass the base URL for the model
+        apiKey: geminiAPIKey,
+        apiURL: geminiBaseURLForFlashModel
       )
       
-      if vm.referencePhoto == nil { vm.bodyTrackingHint = "Tip: Set a reference photo for image generation." }
+      vm.selectedReferenceImage = refVM.selected // Initialize on appear
+      if vm.selectedReferenceImage == nil { vm.bodyTrackingHint = "Tip: Set a reference photo for image generation." }
     }
   }
 }
@@ -399,8 +504,6 @@ struct InfoTextStyle: ViewModifier {
 extension View { func infoStyle() -> some View { self.modifier(InfoTextStyle()) } }
 
 // MARK: - Potential File: Views/ARViewContainer.swift
-// ... (ARViewContainer and its Coordinator remain largely the same as your provided code)
-// (Make sure Coordinator methods like processAnchors, calculate heights etc. are as you provided)
 struct ARViewContainer: UIViewRepresentable {
   @ObservedObject var viewModel: ARViewModel
   @ObservedObject var boxVM: BoxPlacementViewModel
@@ -419,7 +522,7 @@ struct ARViewContainer: UIViewRepresentable {
       DispatchQueue.main.async {
         self.viewModel.bodyTrackingHint = "Body Tracking Active"
         self.viewModel.isBodyTrackingActive = true
-        ARMeshExporter.hasMesh = false // Mesh is separate from body tracking usually
+        ARMeshExporter.hasMesh = false
       }
       print("✅ ARBodyTrackingConfiguration enabled.")
     } else {
@@ -430,9 +533,9 @@ struct ARViewContainer: UIViewRepresentable {
       print("⚠️ ARBodyTrackingConfiguration not supported. Falling back to WorldTracking.")
       let configuration = ARWorldTrackingConfiguration()
       configuration.planeDetection = [.horizontal]
-      configuration.sceneReconstruction = .mesh // Enable this if you want mesh with WorldTracking
+      configuration.sceneReconstruction = .mesh
       view.session.run(configuration)
-      ARMeshExporter.hasMesh = true // If sceneReconstruction is on
+      ARMeshExporter.hasMesh = true
     }
     let coach = ARCoachingOverlayView()
     coach.session = view.session
@@ -456,16 +559,39 @@ struct ARViewContainer: UIViewRepresentable {
     private var currentBodyAnchor: ARBodyAnchor?
     private var cancellables: Set<AnyCancellable> = []
     private var boxAnchors: [UUID: AnchorEntity] = [:]
+    private let autoResetThreshold: Float = -0.35
+    private let autoResetThresholdUncalibratedFactor: Float = -0.15
      
     init(vm: ARViewModel, boxVM: BoxPlacementViewModel) {
       self.vm = vm
       self.boxVM = boxVM
       super.init()
-      vm.$calibrationResetTrigger.sink { [weak self] _ in self?.resetCalibrationInternal() }.store(in: &cancellables)
+      vm.$calibrationResetTrigger
+        .sink { [weak self] _ in self?.resetCalibrationInternal() }
+        .store(in: &cancellables)
+      vm.$triggerFloorMeasurement
+        .sink { [weak self] triggered in
+          if triggered { self?.takeFloorMeasurementForCalibration() }
+        }
+        .store(in: &cancellables)
       boxVM.$boxes.sink { [weak self] boxes in self?.syncBoxes(boxes) }.store(in: &cancellables)
       print("Coordinator Initialized")
     }
 
+    func takeFloorMeasurementForCalibration() {
+      guard let cameraY = arView?.session.currentFrame?.camera.transform.translation.y else {
+        DispatchQueue.main.async {
+          self.vm.calibrationInstruction = "Error: Could not get camera position. Try again."
+          self.vm.triggerFloorMeasurement = false
+        }
+        return
+      }
+      DispatchQueue.main.async {
+        self.vm.processTakenFloorMeasurement(cameraY: cameraY)
+        self.vm.triggerFloorMeasurement = false
+      }
+    }
+      
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
       calculateGeneralCameraHeight(cameraTransform: frame.camera.transform, frame: frame)
       guard let bodyAnchor = self.currentBodyAnchor, vm.isBodyTrackingActive else {
@@ -565,31 +691,77 @@ struct ARViewContainer: UIViewRepresentable {
     }
 
     func calculateGeneralCameraHeight(cameraTransform: matrix_float4x4, frame: ARFrame) {
-      let cameraWorldY = cameraTransform.translation.y; var text: String
-      let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal && $0.classification == .floor }
-      if let floorPlane = floorPlanes.min(by: { $0.transform.translation.y < $1.transform.translation.y }) {
-        text = String(format: "Cam Height: %.2fm (Floor)", cameraWorldY - floorPlane.transform.translation.y)
-      } else {
-          let horizontalPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }
-          if let anyHorizontalPlane = horizontalPlanes.min(by: { $0.transform.translation.y < $1.transform.translation.y }) {
-              text = String(format: "Cam Height: %.2fm (Plane)", cameraWorldY - anyHorizontalPlane.transform.translation.y)
-          } else { text = String(format: "Cam Height: %.2fm (Origin)", cameraWorldY) }
-      }
-      DispatchQueue.main.async {
-        if self.vm.generalCameraHeight != text { self.vm.generalCameraHeight = text }
-      }
+        let cameraWorldY = cameraTransform.translation.y
+        var text: String
+        if !vm.isCalibratingHeight && !vm.automaticResetCooldownActive {
+            var triggerAutoReset = false
+            var reasonForReset = ""
+            if vm.isCalibrated, let calibFloorY = vm.calibratedFloorY {
+                let heightRelativeToCalibrated = cameraWorldY - calibFloorY
+                if heightRelativeToCalibrated < self.autoResetThreshold {
+                    triggerAutoReset = true
+                    reasonForReset = "Height (\(String(format: "%.2f", heightRelativeToCalibrated))m) sig. below calibrated floor."
+                }
+            } else {
+                let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
+                                    .filter { $0.alignment == .horizontal && ($0.classification == .floor || $0.classification == .table) }
+                if let floorPlane = floorPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
+                    let heightRelativeToDetectedFloor = cameraWorldY - floorPlane.transform.translation.y
+                    if heightRelativeToDetectedFloor < (self.autoResetThreshold - 0.15) {
+                        triggerAutoReset = true
+                        reasonForReset = "Height (\(String(format: "%.2f", heightRelativeToDetectedFloor))m) sig. below ARKit floor/table."
+                    }
+                }
+            }
+            if triggerAutoReset {
+                print("!!! AUTO CALIBRATION RESET: \(reasonForReset) !!!")
+                DispatchQueue.main.async { self.vm.resetCalibration(triggeredAutomatically: true) }
+                return
+            }
+        }
+        if vm.isCalibratingHeight { text = "Cam Height: Calibrating..." }
+        else if vm.isCalibrated, let calibratedFloorY = vm.calibratedFloorY {
+            let height = cameraWorldY - calibratedFloorY
+            if height < -0.01 && height >= autoResetThreshold { text = String(format: "Cam Height: %.2fm (Below Calib. Floor)", height) }
+            else { text = String(format: "Cam Height: %.2fm (Calibrated)", height) }
+        } else {
+            if vm.automaticResetCooldownActive { text = "Cam Height: N/A (Auto-Reset)" }
+            else {
+                let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal && ($0.classification == .floor || $0.classification == .table)}
+                if let floorPlane = floorPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
+                    let height = cameraWorldY - floorPlane.transform.translation.y
+                    if height < -0.1 && height >= (autoResetThreshold - 0.15) { text = String(format: "Cam Height: %.2fm (Floor/Table - Low?)", height) }
+                    else { text = String(format: "Cam Height: %.2fm (\(floorPlane.classification == .floor ? "Floor" : "Table"))", height) }
+                } else {
+                    let horizontalPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }
+                    if let anyHorizontalPlane = horizontalPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
+                        let height = cameraWorldY - anyHorizontalPlane.transform.translation.y
+                         if height < -0.1 { text = String(format: "Cam Height: %.2fm (Plane - Low?)", height) }
+                         else { text = String(format: "Cam Height: %.2fm (Plane)", height) }
+                    } else { text = String(format: "Cam Height: %.2fm (Origin)", cameraWorldY) }
+                }
+            }
+        }
+        DispatchQueue.main.async {
+            if !self.vm.automaticResetCooldownActive || text != "Cam Height: N/A (Auto-Reset)" {
+                if self.vm.generalCameraHeight != text { self.vm.generalCameraHeight = text }
+            }
+        }
     }
 
     func determineVisibleBodyParts(bodyAnchor: ARBodyAnchor, frame: ARFrame) {
       guard let arView = self.arView else { DispatchQueue.main.async { self.vm.visibleBodyPartsInfo = "Visible Parts: ARView N/A" }; return }
       var visibleJointsDescriptions: [String] = []
-      let jointsOfInterest: [ARKit.ARSkeleton.JointName] = [.head, .leftShoulder, .leftHand, .rightShoulder, .rightHand, .leftFoot, .rightFoot]
+      // **FIXED PART 2: Changed .hip to .root**
+      let jointsOfInterest: [ARKit.ARSkeleton.JointName] = [.head, .leftShoulder, .leftHand, .rightShoulder, .rightHand, .leftFoot, .rightFoot, .root]
       for jointName in jointsOfInterest {
         guard let jointModelTransform = bodyAnchor.skeleton.modelTransform(for: jointName) else { continue }
         let jointWorldPosition = (bodyAnchor.transform * jointModelTransform).translation
         if let screenPoint = arView.project(jointWorldPosition) {
           let pointInCameraSpace = frame.camera.transform.inverse * SIMD4<Float>(jointWorldPosition.x, jointWorldPosition.y, jointWorldPosition.z, 1.0)
-          if pointInCameraSpace.z < 0 && screenPoint.x >= 0 && screenPoint.x <= arView.bounds.size.width && screenPoint.y >= 0 && screenPoint.y <= arView.bounds.size.height {
+          if pointInCameraSpace.z < 0 &&
+             screenPoint.x >= arView.bounds.minX && screenPoint.x <= arView.bounds.maxX &&
+             screenPoint.y >= arView.bounds.minY && screenPoint.y <= arView.bounds.maxY {
             visibleJointsDescriptions.append(jointName.rawValue.replacingOccurrences(of: "_joint", with: "").replacingOccurrences(of: "_", with: " ").capitalizedFirst())
           }
         }
@@ -615,23 +787,22 @@ struct ARViewContainer: UIViewRepresentable {
         DispatchQueue.main.async {
           self.vm.bodyTrackingHint = self.vm.isBodyTrackingActive ? "Body Tracking Active" : "World Tracking Active"
           self.vm.distanceToPerson = "Looking for subjects..."
+          self.vm.resetCalibration(triggeredAutomatically: false)
         }
       } else { DispatchQueue.main.async { self.vm.bodyTrackingHint = "Session resumed, but config lost." } }
     }
-    private func resetCalibrationInternal() { /* vm.calibratedCameraHeight = 0.0; vm.isCalibrated = false; ... */ } // Simplified for brevity
-    private func syncBoxes(_ boxes: [PlacedBox]) { /* ... (Keep your box syncing logic) ... */ }
+    private func resetCalibrationInternal() { print("Coordinator: Observed calibration reset trigger.") }
+    private func syncBoxes(_ boxes: [PlacedBox]) { /* ... (Existing box syncing logic) ... */ }
   }
 }
-
 
 // MARK: - Potential File: Extensions/String+Helpers.swift
 extension String { func capitalizedFirst() -> String { prefix(1).capitalized + dropFirst() } }
 
 // MARK: - Potential File: Utilities/ARMeshExporter.swift
-// ... (ARMeshExporter remains the same as your provided code)
 struct ARMeshExporter {
   static weak var arView: ARView?
-  static var hasMesh = false // Updated by Coordinator based on ARMeshAnchor or sceneReconstruction
+  static var hasMesh = false
   static func exportCurrentScene() -> URL? {
     guard let view = arView, hasMesh, let anchors = view.session.currentFrame?.anchors else {
       print("Export failed: ARView not set, no mesh, or no current anchors."); return nil
@@ -652,9 +823,7 @@ struct ARMeshExporter {
   }
 }
 
-
 // MARK: - Potential File: Extensions/Metal+MDLVertexFormat.swift
-// ... (MTLVertexFormat extension remains the same as your provided code)
 extension MTLVertexFormat {
     func toMDLVertexFormat() -> MDLVertexFormat {
         switch self {
@@ -671,9 +840,7 @@ extension MTLVertexFormat {
     }
 }
 
-
 // MARK: - Potential File: Extensions/MDLMesh+ARMeshAnchor.swift
-// ... (MDLMesh extension remains the same as your provided code)
 extension MDLMesh {
   convenience init(arMeshAnchor a: ARMeshAnchor, allocator: MTKMeshBufferAllocator) {
     let g = a.geometry
@@ -710,7 +877,7 @@ struct ActivityView: UIViewControllerRepresentable {
 
 // MARK: - Potential File: Extensions/SIMD+Helpers.swift
 extension simd_float4x4 { var translation: simd_float3 { simd_float3(columns.3.x, columns.3.y, columns.3.z) } }
-extension SIMD3 where Scalar == Float { static var zero: SIMD3<Float> { .init(0,0,0) } } // Helper for xyz if not available
+extension SIMD3 where Scalar == Float { static var zero: SIMD3<Float> { .init(0,0,0) } }
 
 // MARK: - Potential File: Models/APIResponse.swift
 struct APIResponse: Identifiable, Codable {
@@ -724,8 +891,8 @@ class APIService {
   private var analysisApiKey: String = ""
   private var analysisApiURL: String = ""
   
-  private var flashApiKey: String = "" // Just the key string
-  private var flashApiURLString: String = "" // Full URL string, constructed with key
+  private var flashApiKey: String = ""
+  private var flashApiURLString: String = ""
 
   func configure(apiKey: String, apiURL: String) {
     self.analysisApiKey = apiKey
@@ -733,23 +900,24 @@ class APIService {
     print("APIService (Analysis) configured. URL: \(apiURL.isEmpty ? "Not Set" : apiURL), Key: \(apiKey.isEmpty ? "Not Set" : "Set")")
   }
    
-  func configureFlash(apiKey: String, apiURL: String) { // apiKey is key string, apiURL is base model endpoint
+  func configureFlash(apiKey: String, apiURL: String) {
     self.flashApiKey = apiKey
     if apiKey.isEmpty {
-        self.flashApiURLString = apiURL // No key to append, use as is (might be for local testing or keyless endpoint)
+        self.flashApiURLString = apiURL
          print("APIService (Flash Gen) configured. API Key IS EMPTY. URL: \(apiURL)")
-    } else if apiURL.contains("?key=") {
-        self.flashApiURLString = apiURL // URL already includes a key parameter
+    } else if apiURL.contains("?key=") || apiURL.contains("&key=") {
+        self.flashApiURLString = apiURL
         print("APIService (Flash Gen) configured. URL (already has key): \(apiURL)")
     } else {
-        self.flashApiURLString = "\(apiURL)?key=\(apiKey)" // Append the key
+        self.flashApiURLString = "\(apiURL)?key=\(apiKey)"
         print("APIService (Flash Gen) configured. URL (appended key): \(self.flashApiURLString)")
     }
   }
    
   func sendAnalysis(image: UIImage, metrics: [String: String]) async throws -> String {
     guard !analysisApiKey.isEmpty, !analysisApiURL.isEmpty else {
-      throw NSError(domain: "APIService.Analysis", code: 1, userInfo: [NSLocalizedDescriptionKey: "Analysis API not configured."])
+      print("Analysis API (separate) not configured. If using Gemini for analysis, ensure its prompt is set correctly elsewhere.")
+      throw NSError(domain: "APIService.Analysis", code: 1, userInfo: [NSLocalizedDescriptionKey: "Analysis API (separate) not configured."])
     }
     guard let url = URL(string: analysisApiURL) else { throw NSError(domain: "APIService.Analysis", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid Analysis API URL."]) }
     guard let imageData = image.jpegData(compressionQuality: 0.8) else { throw NSError(domain: "APIService.Analysis", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to convert image."]) }
@@ -782,7 +950,9 @@ class APIService {
     guard let httpResponse = response as? HTTPURLResponse else { throw NSError(domain: "APIService.GeminiText", code: 204, userInfo: [NSLocalizedDescriptionKey: "Invalid response object."]) }
     print("Gemini Text API Status Code: \(httpResponse.statusCode)")
     guard (200...299).contains(httpResponse.statusCode) else {
-        throw NSError(domain: "APIService.GeminiText", code: 205, userInfo: [NSLocalizedDescriptionKey: "Gemini Text API error. Status: \(httpResponse.statusCode). Details: \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")"])
+        let errorDetail = String(data: data, encoding: .utf8) ?? "No details"
+        print("Gemini Text API Error (\(httpResponse.statusCode)): \(errorDetail)")
+        throw NSError(domain: "APIService.GeminiText", code: 205, userInfo: [NSLocalizedDescriptionKey: "Gemini Text API error. Status: \(httpResponse.statusCode). Details: \(errorDetail.prefix(200))"])
     }
     do {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -790,11 +960,15 @@ class APIService {
               let content = candidates.first?["content"] as? [String: Any],
               let parts = content["parts"] as? [[String: Any]],
               let text = parts.first?["text"] as? String else {
-            throw NSError(domain: "APIService.GeminiText", code: 206, userInfo: [NSLocalizedDescriptionKey: "Could not parse text. Raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "")"])
+            let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
+            print("Could not parse text from Gemini response. Raw: \(rawResponse.prefix(500))")
+            throw NSError(domain: "APIService.GeminiText", code: 206, userInfo: [NSLocalizedDescriptionKey: "Could not parse text. Raw: \(rawResponse.prefix(500))"])
         }
         return text
     } catch {
-        throw NSError(domain: "APIService.GeminiText", code: 207, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "")"])
+        let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
+        print("Failed to decode Gemini text response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))")
+        throw NSError(domain: "APIService.GeminiText", code: 207, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))"])
     }
   }
 
@@ -805,13 +979,12 @@ class APIService {
     guard let url = URL(string: flashApiURLString) else {
         throw NSError(domain: "APIService.FlashGen", code: 103, userInfo: [NSLocalizedDescriptionKey: "Invalid Flash 2.0 API URL: \(flashApiURLString)"])
     }
-    guard let refImageData = referenceImage.jpegData(compressionQuality: 0.8),
+    guard let refImageData = referenceImage.jpegData(compressionQuality: 0.85),
           let currentImageData = currentImage.jpegData(compressionQuality: 0.8) else {
         throw NSError(domain: "APIService.FlashGen", code: 102, userInfo: [NSLocalizedDescriptionKey: "Failed to convert images to JPEG."])
     }
     let base64RefImage = refImageData.base64EncodedString()
     let base64CurrentImage = currentImageData.base64EncodedString()
-    // The 'prompt' parameter already contains detailed instructions including metrics.
     var partsArray: [[String: Any]] = [
         ["text": prompt],
         ["inline_data": ["mime_type": "image/jpeg", "data": base64RefImage]],
@@ -821,34 +994,45 @@ class APIService {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = try JSONSerialization.data(withJSONObject: requestPayload)
-    print("Sending image generation request to Flash Gen API (Multimodal): \(url.absoluteString).")
+    print("Sending multimodal request to Flash Gen API: \(url.absoluteString). Prompt length: \(prompt.count) chars.")
     let (data, response) = try await URLSession.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse else { throw NSError(domain: "APIService.FlashGen", code: 104, userInfo: [NSLocalizedDescriptionKey: "Invalid response object."]) }
     print("Flash Gen API (Multimodal) Status Code: \(httpResponse.statusCode)")
     guard (200...299).contains(httpResponse.statusCode) else {
-        throw NSError(domain: "APIService.FlashGen", code: 105, userInfo: [NSLocalizedDescriptionKey: "Flash API error. Status: \(httpResponse.statusCode). Details: \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")"])
+        let errorDetail = String(data: data, encoding: .utf8) ?? "No details"
+        print("Flash API Error (\(httpResponse.statusCode)): \(errorDetail)")
+        throw NSError(domain: "APIService.FlashGen", code: 105, userInfo: [NSLocalizedDescriptionKey: "Flash API error. Status: \(httpResponse.statusCode). Details: \(errorDetail.prefix(500))"])
     }
     do {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw NSError(domain: "APIService.FlashGen", code: 107, userInfo: [NSLocalizedDescriptionKey: "Response not valid JSON."])
         }
-        var directivesText = "No text part in Gemini response."
+        var directivesText = "Error: No text part found in Gemini response."
         if let candidates = json["candidates"] as? [[String: Any]],
-           let content = candidates.first?["content"] as? [String: Any],
+           let firstCandidate = candidates.first,
+           let content = firstCandidate["content"] as? [String: Any],
            let parts = content["parts"] as? [[String: Any]] {
-            for part in parts { if let text = part["text"] as? String { directivesText = text; break } }
+            for part in parts {
+                if let text = part["text"] as? String {
+                    directivesText = text; break
+                }
+            }
+        } else {
+             let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
+             print("Could not parse 'candidates' or 'parts' from Gemini response. Raw: \(rawResponse.prefix(500))")
+             directivesText = "Error: Could not parse full response structure. Check logs."
         }
-        // For this specific prompt, we primarily expect text directives, not a new image from Gemini.
         print("Parsed response from Flash Gen API. Directives: \(directivesText.prefix(100))...")
-        return (directivesText, nil) // No generated image expected from this prompt flow.
+        return (directivesText, nil)
     } catch {
-        throw NSError(domain: "APIService.FlashGen", code: 106, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "")"])
+        let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
+        print("Failed to decode Flash Gen response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))")
+        throw NSError(domain: "APIService.FlashGen", code: 106, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))"])
     }
   }
 }
 
 // MARK: - Potential File: Views/ResponsesView.swift
-// ... (ResponsesView and ResponsesViewModel remain the same as your provided code)
 struct ResponsesView: View {
   @StateObject private var viewModel = ResponsesViewModel()
   @Environment(\.dismiss) var dismiss
@@ -861,7 +1045,7 @@ struct ResponsesView: View {
               ForEach(viewModel.responses) { response in
                 VStack(alignment: .leading, spacing: 8) {
                   Text("Response from \(response.timestamp, style: .relative)").font(.caption2).foregroundColor(.secondary)
-                  Text(response.response).font(.body).lineLimit(nil) // Ensure it can show multi-line
+                  Text(response.response).font(.body).lineLimit(nil).textSelection(.enabled)
                 }.padding(.vertical, 4)
               }.onDelete(perform: viewModel.deleteResponse)
             }
@@ -879,7 +1063,7 @@ struct ResponsesView: View {
 class ResponsesViewModel: ObservableObject {
   @Published var responses: [APIResponse] = []
   private let userDefaultsKey = "savedPolarisOneResponses"
-  func loadResponsesAsync() async { /* ... same ... */
+  func loadResponsesAsync() async {
     DispatchQueue.main.async {
         if let data = UserDefaults.standard.data(forKey: self.userDefaultsKey),
            let decoded = try? JSONDecoder().decode([APIResponse].self, from: data) {
@@ -887,11 +1071,12 @@ class ResponsesViewModel: ObservableObject {
         } else { self.responses = [] }
     }
   }
-  func saveResponse(_ response: APIResponse) { /* ... same ... */
+  func saveResponse(_ response: APIResponse) {
     responses.insert(response, at: 0); responses.sort(by: { $0.timestamp > $1.timestamp })
+    if responses.count > 50 { responses = Array(responses.prefix(50)) }
     if let encoded = try? JSONEncoder().encode(responses) { UserDefaults.standard.set(encoded, forKey: userDefaultsKey) }
   }
-  func deleteResponse(at offsets: IndexSet) { /* ... same ... */
+  func deleteResponse(at offsets: IndexSet) {
       responses.remove(atOffsets: offsets)
       if let encoded = try? JSONEncoder().encode(responses) { UserDefaults.standard.set(encoded, forKey: userDefaultsKey) }
   }
@@ -899,9 +1084,9 @@ class ResponsesViewModel: ObservableObject {
 
 // MARK: - Reference Image Handling (Model, Manager, ViewModel, Picker, Selector)
 struct ReferenceImageMetadata: Codable, Equatable {
-    var distanceFromCamera: String // e.g., "0.9 m"
-    var distanceBelowEyeline: String // e.g., "0.1 m"
-    var cameraHeight: String // e.g., "1.2 m"
+    var distanceFromCamera: String
+    var distanceBelowEyeline: String
+    var cameraHeight: String
     static var empty: ReferenceImageMetadata { ReferenceImageMetadata(distanceFromCamera: "", distanceBelowEyeline: "", cameraHeight: "") }
 }
 
@@ -911,11 +1096,15 @@ struct ReferenceImage: Identifiable, Codable, Equatable {
     let dateAdded: Date
     var metadata: ReferenceImageMetadata
     var image: UIImage? { UIImage(contentsOfFile: ReferenceImageManager.shared.url(for: filename).path) }
+    
+    static func == (lhs: ReferenceImage, rhs: ReferenceImage) -> Bool {
+        lhs.id == rhs.id
+    }
 }
 
 class ReferenceImageManager {
     static let shared = ReferenceImageManager()
-    private let key = "referenceImages"
+    private let key = "referenceImages_v2"
     private let folder = "ReferenceImages"
     private var folderURL: URL {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(folder)
@@ -924,7 +1113,7 @@ class ReferenceImageManager {
     }
     func url(for filename: String) -> URL { folderURL.appendingPathComponent(filename) }
     func saveImage(_ image: UIImage, metadata: ReferenceImageMetadata) -> ReferenceImage? {
-        let id = UUID(); let filename = "refimg_\(id).jpg"; let url = self.url(for: filename)
+        let id = UUID(); let filename = "refimg_\(id.uuidString).jpg"; let url = self.url(for: filename)
         guard let data = image.jpegData(compressionQuality: 0.9) else { return nil }
         do {
             try data.write(to: url)
@@ -947,19 +1136,67 @@ class ReferenceImageViewModel: ObservableObject {
     @Published var showMetadataInput = false
     @Published var pendingImage: UIImage? = nil
     @Published var metadataInput = ReferenceImageMetadata.empty
+    
+    private let selectedKey = "selectedRefImg_v2"
+
     init() { load(); loadSelection() }
-    func load() { images = ReferenceImageManager.shared.loadImages(); if selected == nil || !images.contains(where: {$0.id == selected!.id}) { selected = images.first } }
-    func add(image: UIImage, metadata: ReferenceImageMetadata) {
-        if let ref = ReferenceImageManager.shared.saveImage(image, metadata: metadata) { images.append(ref); select(ref) }
+    
+    func load() {
+        images = ReferenceImageManager.shared.loadImages().sorted(by: { $0.dateAdded > $1.dateAdded })
+        if let selId = selected?.id, !images.contains(where: { $0.id == selId }) {
+            selected = images.first
+            saveSelection()
+        } else if selected == nil && !images.isEmpty {
+             // loadSelection() is called in init
+        }
     }
-    func select(_ ref: ReferenceImage) { selected = ref; saveSelection() }
-    func delete(_ ref: ReferenceImage) { ReferenceImageManager.shared.deleteImage(ref); images.removeAll { $0.id == ref.id }; if selected?.id == ref.id { selected = images.first; saveSelection() } }
-    func saveSelection() { if let sel = selected, let data = try? JSONEncoder().encode(sel) { UserDefaults.standard.set(data, forKey: "selectedRefImg") } }
-    func loadSelection() { if let data = UserDefaults.standard.data(forKey: "selectedRefImg"), let sel = try? JSONDecoder().decode(ReferenceImage.self, from: data) { selected = sel } }
+    
+    func add(image: UIImage, metadata: ReferenceImageMetadata) {
+        if let ref = ReferenceImageManager.shared.saveImage(image, metadata: metadata) {
+            images.insert(ref, at: 0)
+            images.sort(by: { $0.dateAdded > $1.dateAdded })
+            select(ref)
+        }
+    }
+    
+    func select(_ ref: ReferenceImage?) {
+        selected = ref
+        saveSelection()
+    }
+    
+    func delete(_ ref: ReferenceImage) {
+        ReferenceImageManager.shared.deleteImage(ref)
+        images.removeAll { $0.id == ref.id }
+        if selected?.id == ref.id {
+            selected = images.first
+            saveSelection()
+        }
+    }
+    
+    func saveSelection() {
+        if let sel = selected, let data = try? JSONEncoder().encode(sel.id) {
+            UserDefaults.standard.set(data, forKey: selectedKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: selectedKey)
+        }
+    }
+    
+    func loadSelection() {
+        if let data = UserDefaults.standard.data(forKey: selectedKey),
+           let selId = try? JSONDecoder().decode(UUID.self, from: data) {
+            selected = images.first(where: { $0.id == selId }) ?? images.first
+        } else if !images.isEmpty {
+            selected = images.first
+        } else {
+            selected = nil
+        }
+    }
 }
 
 struct ReferenceImageSelector: View {
     @ObservedObject var vm: ReferenceImageViewModel
+    @Environment(\.dismiss) var dismissSheet
+
     var body: some View {
         NavigationView {
             List {
@@ -970,20 +1207,24 @@ struct ReferenceImageSelector: View {
                         }
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Added: \(ref.dateAdded, formatter: dateFormatter)").font(.caption)
-                            if vm.selected == ref { Text("Selected").font(.caption2).foregroundColor(.accentColor) }
+                            if vm.selected == ref {
+                                Text("Selected").font(.caption2).bold().foregroundColor(.accentColor)
+                            }
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Distance from camera: \(ref.metadata.distanceFromCamera)").font(.caption2)
-                                Text("Below eyeline: \(ref.metadata.distanceBelowEyeline)").font(.caption2)
-                                Text("Camera height: \(ref.metadata.cameraHeight)").font(.caption2)
+                                Text("Dist: \(ref.metadata.distanceFromCamera.isEmpty ? "N/A" : ref.metadata.distanceFromCamera)m").font(.caption2)
+                                Text("Eyeline: \(ref.metadata.distanceBelowEyeline.isEmpty ? "N/A" : ref.metadata.distanceBelowEyeline)m").font(.caption2)
+                                Text("Cam Height: \(ref.metadata.cameraHeight.isEmpty ? "N/A" : ref.metadata.cameraHeight)m").font(.caption2)
                             }
                         }
                         Spacer()
                         if vm.selected != ref {
-                            Button("Select") { vm.select(ref) }
+                            Button("Select") { vm.select(ref); dismissSheet() }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
                         }
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture { vm.select(ref) }
+                    .onTapGesture { vm.select(ref); dismissSheet() }
                 }
                 .onDelete(perform: { offsets in
                     offsets.map { vm.images[$0] }.forEach { vm.delete($0) }
@@ -995,7 +1236,7 @@ struct ReferenceImageSelector: View {
                     Button { vm.showPicker = true } label: { Image(systemName: "plus") }
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Done") { vm.showSelector = false }
+                    Button("Done") { dismissSheet() }
                 }
             }
             .sheet(isPresented: $vm.showPicker) {
@@ -1008,6 +1249,9 @@ struct ReferenceImageSelector: View {
             .sheet(isPresented: $vm.showMetadataInput) {
                 ReferenceImageMetadataInputView(vm: vm)
             }
+            .onAppear {
+                vm.load()
+            }
         }
     }
 }
@@ -1017,23 +1261,29 @@ struct ReferenceImageMetadataInputView: View {
     @State private var distanceFromCamera: String = ""
     @State private var distanceBelowEyeline: String = ""
     @State private var cameraHeight: String = ""
+    
+    @Environment(\.dismiss) var dismissInputSheet
+
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("Reference Image Metadata")) {
-                    TextField("Distance from camera (m)", text: $distanceFromCamera)
+                Section(header: Text("Reference Image Metadata (Optional)")) {
+                    TextField("Approx. subject distance from camera (m)", text: $distanceFromCamera)
                         .keyboardType(.decimalPad)
-                    TextField("Distance below subject's eyeline (m)", text: $distanceBelowEyeline)
+                    TextField("Approx. camera below subject's eyeline (m)", text: $distanceBelowEyeline)
                         .keyboardType(.decimalPad)
-                    TextField("Camera height (m)", text: $cameraHeight)
+                    TextField("Approx. camera height from floor (m)", text: $cameraHeight)
                         .keyboardType(.decimalPad)
                 }
+                 Text("These values help the AI understand the reference photo's perspective. Provide estimates if exact values are unknown. You can leave them blank.")
+                    .font(.caption)
+                    .foregroundColor(.gray)
             }
             .navigationTitle("Add Metadata")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Cancel") {
-                        vm.showMetadataInput = false
+                        dismissInputSheet()
                         vm.pendingImage = nil
                     }
                 }
@@ -1047,9 +1297,9 @@ struct ReferenceImageMetadataInputView: View {
                         if let img = vm.pendingImage {
                             vm.add(image: img, metadata: meta)
                         }
-                        vm.showMetadataInput = false
+                        dismissInputSheet()
                         vm.pendingImage = nil
-                    }.disabled(distanceFromCamera.isEmpty || distanceBelowEyeline.isEmpty || cameraHeight.isEmpty)
+                    }
                 }
             }
         }
@@ -1063,21 +1313,21 @@ struct ReferenceImageMetadataInputView: View {
 private let dateFormatter: DateFormatter = { let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short; return df }()
 
 // MARK: - Box Placement (Model, ViewModel, UI)
-// ... (All BoxPlacement related code remains the same as your provided code)
 struct PlacedBox: Identifiable, Codable, Equatable { let id: UUID; let offset: SIMD3<Float>; let dateAdded: Date }
-class BoxPlacementViewModel: ObservableObject { /* ... */
+class BoxPlacementViewModel: ObservableObject {
     @Published var boxes: [PlacedBox] = []; @Published var showBoxInput = false; @Published var inputX="0.0"; @Published var inputY="0.0"; @Published var inputZ="0.0"
     func addBox(x: Float, y: Float, z: Float) { boxes.append(PlacedBox(id: UUID(), offset: .init(x,y,z), dateAdded: Date())) }
     func deleteBox(_ box: PlacedBox) { boxes.removeAll { $0.id == box.id } }
 }
-struct BoxPlacementPanel: View { /* ... */
+struct BoxPlacementPanel: View {
     @ObservedObject var vm: BoxPlacementViewModel; var onAdd: (PlacedBox)->Void; var onDelete: (PlacedBox)->Void
+    @Environment(\.dismiss) var dismiss
     var body: some View { NavigationView { VStack(spacing:16) {
         HStack { TextField("X (R+)",text:$vm.inputX); TextField("Y (U+)",text:$vm.inputY); TextField("Z (F+)",text:$vm.inputZ)}.keyboardType(.decimalPad).textFieldStyle(.roundedBorder)
         HStack(spacing:12){Label("+X:Right",systemImage:"arrow.right");Label("+Y:Up",systemImage:"arrow.up");Label("+Z:Fwd",systemImage:"arrow.up.right")}.font(.caption2).foregroundColor(.secondary)
         Button("Place Box"){guard let x=Float(vm.inputX),let y=Float(vm.inputY),let z=Float(vm.inputZ)else{return};let box=PlacedBox(id:UUID(),offset:.init(x,y,z),dateAdded:Date());vm.addBox(x:x,y:y,z:z);onAdd(box)}.buttonStyle(.borderedProminent)
         List{ForEach(vm.boxes){box in HStack{Text(String(format:"x:%.1f,y:%.1f,z:%.1f",box.offset.x,box.offset.y,box.offset.z));Spacer();Button(role:.destructive){vm.deleteBox(box);onDelete(box)}label:{Image(systemName:"trash")}}}}
-    }.padding().navigationTitle("Box Placement").toolbar{ToolbarItem(placement:.navigationBarLeading){Button("Done"){vm.showBoxInput=false}}}}}
+    }.padding().navigationTitle("Box Placement").toolbar{ToolbarItem(placement:.navigationBarLeading){Button("Done"){ dismiss() }}}}}
 }
 
 // MARK: - SIMD Quaternion Helper
@@ -1085,7 +1335,7 @@ extension simd_quatf {
     init(from: SIMD3<Float>, to: SIMD3<Float>) {
         let nFrom = normalize(from); let nTo = normalize(to); let axis = cross(nFrom, nTo)
         let angle = acos(min(max(dot(nFrom, nTo), -1), 1))
-        if simd.length(axis) < 0.0001 { self = simd_quatf(angle: dot(nFrom, nTo) > 0 ? 0 : .pi, axis: [0,1,0]) } // Check for parallel or anti-parallel
+        if simd.length(axis) < 0.0001 { self = simd_quatf(angle: dot(nFrom, nTo) > 0 ? 0 : .pi, axis: [0,1,0]) }
         else { self = simd_quatf(angle: angle, axis: normalize(axis)) }
     }
 }
@@ -1117,3 +1367,4 @@ struct ImagePicker: UIViewControllerRepresentable {
         }
     }
 }
+
