@@ -75,6 +75,10 @@ final class ARViewModel: ObservableObject {
   // --- Automatic Reset Failsafe ---
   @Published var automaticResetCooldownActive: Bool = false
   private var automaticResetTimer: Timer?
+  
+  // --- Settings ---
+  @Published var showDetailedMetrics: Bool = true
+  @Published var showSettings: Bool = false
 
   // --- New Camera/Scene Properties ---
   @Published var cameraRoll: Float?
@@ -476,17 +480,21 @@ struct ContentView: View {
                 vm.bodyTrackingHint.lowercased().contains("auto-reset") ? .red : .primary
             ).font(.caption2).lineLimit(2) // Smaller font
         }
-        Text("Subjects: \(vm.detectedSubjectCount)").infoStyle(fontSize: .caption2)
-        Text(vm.distanceToPerson).infoStyle(fontSize: .caption2)
-        Text(vm.cameraHeightRelativeToEyes).infoStyle(fontSize: .caption2, lineLimit: 2)
-        Text(vm.generalCameraHeight).infoStyle(fontSize: .caption2, lineLimit: 2)
-        Text(vm.visibleBodyPartsInfo).infoStyle(fontSize: .caption2, lineLimit: 2)
         
-        // --- New Info Displays ---
-        Text(vm.cameraOrientationDegString).infoStyle(fontSize: .caption2)
-        Text(vm.fieldOfViewDegString).infoStyle(fontSize: .caption2)
-        Text(vm.ambientLuxString).infoStyle(fontSize: .caption2)
-        Text(vm.colorTempKString).infoStyle(fontSize: .caption2)
+        // Only show detailed metrics if enabled in settings
+        if vm.showDetailedMetrics {
+          Text("Subjects: \(vm.detectedSubjectCount)").infoStyle(fontSize: .caption2)
+          Text(vm.distanceToPerson).infoStyle(fontSize: .caption2)
+          Text(vm.cameraHeightRelativeToEyes).infoStyle(fontSize: .caption2, lineLimit: 2)
+          Text(vm.generalCameraHeight).infoStyle(fontSize: .caption2, lineLimit: 2)
+          Text(vm.visibleBodyPartsInfo).infoStyle(fontSize: .caption2, lineLimit: 2)
+          
+          // --- New Info Displays ---
+          Text(vm.cameraOrientationDegString).infoStyle(fontSize: .caption2)
+          Text(vm.fieldOfViewDegString).infoStyle(fontSize: .caption2)
+          Text(vm.ambientLuxString).infoStyle(fontSize: .caption2)
+          Text(vm.colorTempKString).infoStyle(fontSize: .caption2)
+        }
 
       }
       .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)) // Adjusted padding
@@ -503,6 +511,13 @@ struct ContentView: View {
 
         HStack(spacing: 15) {
           Spacer()
+          
+          // Settings button
+          Button(action: { vm.showSettings = true }) {
+            Image(systemName: "gear").font(.system(size: 20, weight: .semibold))
+              .padding(12).background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Settings")
+          }
+          
           Button(action: { vm.captureAndAnalyze() }) {
             Image(systemName: "wand.and.stars").font(.system(size: 20, weight: .semibold)) // Smaller icon
               .padding(12).background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Analyze Scene (Gemini)") // Smaller padding
@@ -546,6 +561,9 @@ struct ContentView: View {
     .sheet(isPresented: $boxVM.showBoxInput) {
       BoxPlacementPanel(vm: boxVM, onAdd: { _ in }, onDelete: { _ in })
     }
+    .sheet(isPresented: $vm.showSettings) {
+      SettingsView(viewModel: vm)
+    }
     .onChange(of: refVM.selected) { newValue in
         vm.selectedReferenceImage = newValue
         if newValue == nil && !vm.isGeneratingPhoto && !vm.isCapturing {
@@ -562,7 +580,7 @@ struct ContentView: View {
       
       struct EnvHelper { static func value(for key: String) -> String { return ProcessInfo.processInfo.environment[key] ?? "" } }
       let geminiAPIKey = EnvHelper.value(for: "GEMINI_API_KEY")
-      let geminiBaseURLForFlashModel = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+      let geminiBaseURLForFlashModel = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
       
       APIService.shared.configureFlash(
         apiKey: geminiAPIKey,
@@ -1279,6 +1297,42 @@ class ResponsesViewModel: ObservableObject {
   func deleteResponse(at offsets: IndexSet) {
       responses.remove(atOffsets: offsets)
       if let encoded = try? JSONEncoder().encode(responses) { UserDefaults.standard.set(encoded, forKey: userDefaultsKey) }
+  }
+}
+
+// MARK: - Settings View
+struct SettingsView: View {
+  @ObservedObject var viewModel: ARViewModel
+  @Environment(\.dismiss) var dismiss
+  
+  var body: some View {
+    NavigationView {
+      Form {
+        Section(header: Text("Display Options")) {
+          Toggle("Show Detailed Metrics", isOn: $viewModel.showDetailedMetrics)
+            .toggleStyle(SwitchToggleStyle())
+          
+          Text("When disabled, hides all metrics except the AR tracking hint")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        
+        Section(header: Text("About")) {
+          HStack {
+            Text("Version")
+            Spacer()
+            Text("1.0.0")
+              .foregroundColor(.secondary)
+          }
+        }
+      }
+      .navigationTitle("Settings")
+      .toolbar {
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button("Done") { dismiss() }
+        }
+      }
+    }
   }
 }
 
