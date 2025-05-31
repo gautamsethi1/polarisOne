@@ -27,6 +27,7 @@ import Foundation // URL, Date, FileManager
 import simd // simd_float4x4
 import Combine
 import AVFoundation // Added for AVCaptureDevice
+import Vision // For ML-based human detection
 
 // MARK: - Potential File: Extensions/URL+Identifiable.swift
 // MARK: – Convenience so URL works with .sheet(item:)
@@ -97,6 +98,11 @@ final class ARViewModel: ObservableObject {
   
   // Store the latest structured response for potential UI use
   @Published var latestStructuredGuidance: StructuredGeminiResponse? = nil
+  
+  // Subject detection and guidance state
+  @Published var currentSubjectBounds: SubjectBounds? = nil
+  @Published var activeGuidanceBox: GuidanceBox? = nil
+  @Published var isGuidanceActive: Bool = false
 
 
 
@@ -419,6 +425,15 @@ final class ARViewModel: ObservableObject {
             // Store the structured guidance for potential UI use
             self.latestStructuredGuidance = structuredResponse
             
+            // Trigger guidance box creation if we have subject bounds
+            if let subjectBounds = self.currentSubjectBounds {
+              print("✅ Subject bounds available, creating guidance box")
+              self.activateGuidanceBox(for: structuredResponse, subjectBounds: subjectBounds)
+            } else {
+              print("❌ No subject bounds available - cannot create guidance box")
+              print("💡 Ensure a human subject is detected before analyzing scene")
+            }
+            
             // Show brief hint with key adjustment
             var keyAdjustment = "Check responses for guidance"
             if let summary = structuredResponse.summary {
@@ -454,6 +469,68 @@ final class ARViewModel: ObservableObject {
           isCapturing = false
           self.bodyTrackingHint = "Analysis failed: \(error.localizedDescription)"
         }
+      }
+    }
+  }
+  
+  // Activate guidance box based on LLM recommendations
+  func activateGuidanceBox(for guidance: StructuredGeminiResponse, subjectBounds: SubjectBounds) {
+    guard let arView = ARMeshExporter.arView else { 
+      print("❌ activateGuidanceBox: ARView is nil")
+      return 
+    }
+    
+    print("✅ activateGuidanceBox called with subject at: \(subjectBounds.center)")
+    
+    // Calculate subject-relative offset based on LLM recommendations
+    let cameraTransform = arView.session.currentFrame?.camera.transform ?? matrix_identity_float4x4
+    
+    let relativeOffset = GuidanceBoxService.shared.calculateSubjectRelativeOffset(
+      currentSubjectBounds: subjectBounds,
+      recommendations: guidance.adjustments,
+      cameraTransform: cameraTransform
+    )
+    
+    print("📍 Subject-relative offset calculated: \(relativeOffset)")
+    print("📏 Offset magnitude: \(simd_length(relativeOffset))m")
+    
+    // Create guidance box with subject-relative positioning
+    let guidanceBox = GuidanceBoxService.shared.createGuidanceBox(
+      relativeOffset: relativeOffset,
+      subjectBounds: subjectBounds,
+      recommendations: guidance.adjustments
+    )
+    
+    print("📦 Guidance box created with size: \(guidanceBox.size)")
+    
+    // Update state
+    activeGuidanceBox = guidanceBox
+    isGuidanceActive = true
+    
+    // Show in AR view
+    GuidanceBoxRenderer.shared.showGuidanceBox(guidanceBox, in: arView)
+    
+    bodyTrackingHint = "Guidance active: Green box follows subject position"
+    print("✅ Guidance box should now be visible")
+  }
+  
+  // Toggle guidance on/off
+  func toggleGuidance() {
+    guard let arView = ARMeshExporter.arView else { return }
+    
+    if isGuidanceActive {
+      // Hide guidance
+      GuidanceBoxRenderer.shared.hideGuidanceBox(in: arView)
+      isGuidanceActive = false
+      activeGuidanceBox = nil
+      bodyTrackingHint = "Guidance disabled"
+    } else {
+      // Try to reactivate guidance if we have data
+      if let guidance = latestStructuredGuidance,
+         let subjectBounds = currentSubjectBounds {
+        activateGuidanceBox(for: guidance, subjectBounds: subjectBounds)
+      } else {
+        bodyTrackingHint = "No guidance data available. Analyze scene first."
       }
     }
   }
@@ -507,7 +584,7 @@ struct ContentView: View {
         
         // Only show detailed metrics if enabled in settings
         if vm.showDetailedMetrics {
-          Text("Subjects: \(vm.detectedSubjectCount)").infoStyle(fontSize: .caption2)
+          Text("Humans: \(vm.detectedSubjectCount)").infoStyle(fontSize: .caption2)
           Text(vm.distanceToPerson).infoStyle(fontSize: .caption2)
           Text(vm.cameraHeightRelativeToEyes).infoStyle(fontSize: .caption2, lineLimit: 2)
           Text(vm.generalCameraHeight).infoStyle(fontSize: .caption2, lineLimit: 2)
@@ -549,6 +626,17 @@ struct ContentView: View {
               .background(.ultraThinMaterial, in: Circle())
               .foregroundColor(.white)
           }
+          
+          // Guidance toggle button
+          Button(action: { vm.toggleGuidance() }) {
+            Image(systemName: vm.isGuidanceActive ? "cube.fill" : "cube")
+              .font(.system(size: 22, weight: .semibold))
+              .frame(width: 42, height: 42)
+              .background(.ultraThinMaterial, in: Circle())
+              .foregroundColor(vm.isGuidanceActive ? .green : .white)
+          }
+          .disabled(vm.isCapturing || vm.isGeneratingPhoto)
+          .opacity((vm.isCapturing || vm.isGeneratingPhoto) ? 0.5 : 1.0)
           
           Spacer()
           
@@ -695,6 +783,9 @@ struct ARViewContainer: UIViewRepresentable {
     private var distanceBuffer: [Float] = []
     private var heightBuffer: [Float] = []
     private let bufferSize = 3 // Reduced for more responsive updates
+    
+    // Validation cache for fast human detection
+    private var validationCache: [UUID: Bool] = [:]
      
     init(vm: ARViewModel, boxVM: BoxPlacementViewModel) {
       self.vm = vm
@@ -743,6 +834,9 @@ struct ARViewContainer: UIViewRepresentable {
           newAmbientLux = Float(lightEstimate.ambientIntensity)
           newColorTempK = Float(lightEstimate.ambientColorTemperature)
       }
+      
+      // Enhanced subject detection combining ARKit and Vision
+      updateSubjectDetection(frame: frame)
 
       DispatchQueue.main.async {
           // Update ViewModel properties if they changed
@@ -759,7 +853,7 @@ struct ARViewContainer: UIViewRepresentable {
         if vm.detectedSubjectCount > 0 && vm.isBodyTrackingActive {
             DispatchQueue.main.async {
                 self.vm.detectedSubjectCount = 0
-                self.vm.distanceToPerson = "Looking for subjects..."
+                self.vm.distanceToPerson = "Looking for humans..."
                 self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"
                 self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
             }
@@ -829,6 +923,20 @@ struct ARViewContainer: UIViewRepresentable {
       calculateCameraHeightRelativeToEyes(bodyAnchor: bodyAnchor, cameraTransform: cameraTransform)
       determineVisibleBodyParts(bodyAnchor: bodyAnchor, frame: frame)
       
+      // Calculate subject bounds from ARKit body tracking
+      if let subjectBounds = SubjectDetectionService.shared.calculateARSubjectBounds(from: bodyAnchor) {
+        DispatchQueue.main.async {
+          self.vm.currentSubjectBounds = subjectBounds
+          
+          // Update guidance box position to follow subject if active
+          if self.vm.isGuidanceActive,
+             let arView = self.arView {
+            // Update box position based on current subject movement using the new subject-anchored system
+            GuidanceBoxRenderer.shared.updateBoxPositionForSubject(subjectBounds: subjectBounds, in: arView)
+          }
+        }
+      }
+      
       DispatchQueue.main.async {
         // Always update for fresh values
         self.vm.distanceToPerson = distanceString
@@ -843,12 +951,17 @@ struct ARViewContainer: UIViewRepresentable {
         self.currentBodyAnchor = nil; bodyAnchorRemoved = true
         print("Tracked body anchor \(currentId) removed.")
       }
+      
+      // Clean up validation cache for removed anchors
+      for anchor in anchors {
+        validationCache.removeValue(forKey: anchor.identifier)
+      }
       if let currentFrame = session.currentFrame {
          let bodyAnchorsInFrame = currentFrame.anchors.compactMap { $0 as? ARBodyAnchor }
          DispatchQueue.main.async {
            if self.vm.detectedSubjectCount != bodyAnchorsInFrame.count { self.vm.detectedSubjectCount = bodyAnchorsInFrame.count }
            if bodyAnchorRemoved && bodyAnchorsInFrame.isEmpty {
-                self.vm.distanceToPerson = "Looking for subjects..."; self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"; self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
+                self.vm.distanceToPerson = "Looking for humans..."; self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"; self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
            } else if bodyAnchorRemoved && !bodyAnchorsInFrame.isEmpty {
                self.currentBodyAnchor = bodyAnchorsInFrame.first
                print("Switched to new body anchor: \(self.currentBodyAnchor?.identifier.uuidString ?? "None") after removal.")
@@ -862,27 +975,87 @@ struct ARViewContainer: UIViewRepresentable {
           print("----> Found MESH ANCHOR on \(event)")
           DispatchQueue.main.async { ARMeshExporter.hasMesh = true }
       }
+      
+      // Filter body anchors to only include validated humans
       let bodyAnchors = anchors.compactMap { $0 as? ARBodyAnchor }
-      if !bodyAnchors.isEmpty {
-        print("----> Found \(bodyAnchors.count) BODY ANCHOR(s) on \(event)!")
+      let validatedHumanAnchors = bodyAnchors.filter { validateHumanBody($0) }
+      
+      if !validatedHumanAnchors.isEmpty {
+        print("----> Found \(validatedHumanAnchors.count) VALIDATED HUMAN(s) on \(event)!")
         if self.currentBodyAnchor == nil || !anchors.contains(where: { $0.identifier == self.currentBodyAnchor!.identifier }) {
-          self.currentBodyAnchor = bodyAnchors.first
-           print("----> Now Tracking body anchor: \(self.currentBodyAnchor!.identifier)")
+          self.currentBodyAnchor = validatedHumanAnchors.first
+           print("----> Now Tracking human body anchor: \(self.currentBodyAnchor!.identifier)")
         }
       }
+      
       if let currentFrame = session.currentFrame {
          let allBodyAnchorsInFrame = currentFrame.anchors.compactMap { $0 as? ARBodyAnchor }
+         let validatedHumansInFrame = allBodyAnchorsInFrame.filter { validateHumanBody($0) }
+         
          DispatchQueue.main.async {
-          if self.vm.detectedSubjectCount != allBodyAnchorsInFrame.count {
-            self.vm.detectedSubjectCount = allBodyAnchorsInFrame.count
-            print("----> Updated Subject Count: \(allBodyAnchorsInFrame.count)")
+          if self.vm.detectedSubjectCount != validatedHumansInFrame.count {
+            self.vm.detectedSubjectCount = validatedHumansInFrame.count
+            print("----> Updated Human Subject Count: \(validatedHumansInFrame.count)")
           }
-          if allBodyAnchorsInFrame.isEmpty && self.currentBodyAnchor != nil {
+          if validatedHumansInFrame.isEmpty && self.currentBodyAnchor != nil {
               self.currentBodyAnchor = nil
-              print("----> No body anchors in frame. Cleared currentBodyAnchor.")
+              print("----> No validated human bodies in frame. Cleared currentBodyAnchor.")
           }
          }
       }
+    }
+    
+    // Validate that a body anchor represents a real human - FAST & PRACTICAL
+    private func validateHumanBody(_ bodyAnchor: ARBodyAnchor) -> Bool {
+      // Trust ARKit completely - it already filters for humans
+      let trustARKitCompletely = true
+      
+      if trustARKitCompletely {
+        // ARKit body tracking only detects humans, so any body anchor is valid
+        return true
+      }
+      
+      // Optional validation (disabled by default for speed)
+      // Cache validation results to avoid repeated checks
+      if let cachedResult = validationCache[bodyAnchor.identifier] {
+        return cachedResult
+      }
+      
+      let skeleton = bodyAnchor.skeleton
+      
+      // Fast check: Just verify we have at least 2 joints
+      var jointCount = 0
+      let minJoints = 2
+      
+      // Check only the most important joints first
+      if skeleton.modelTransform(for: .head) != nil { jointCount += 1 }
+      if jointCount >= minJoints { 
+        validationCache[bodyAnchor.identifier] = true
+        return true 
+      }
+      
+      if skeleton.modelTransform(for: .root) != nil { jointCount += 1 }
+      if jointCount >= minJoints { 
+        validationCache[bodyAnchor.identifier] = true
+        return true 
+      }
+      
+      if skeleton.modelTransform(for: .leftShoulder) != nil { jointCount += 1 }
+      if jointCount >= minJoints { 
+        validationCache[bodyAnchor.identifier] = true
+        return true 
+      }
+      
+      if skeleton.modelTransform(for: .rightShoulder) != nil { jointCount += 1 }
+      
+      let isValid = jointCount >= minJoints
+      validationCache[bodyAnchor.identifier] = isValid
+      
+      if !isValid {
+        print("Body validation failed: Only \(jointCount) joints tracked")
+      }
+      
+      return isValid
     }
 
     func calculateCameraHeightRelativeToEyes(bodyAnchor: ARBodyAnchor, cameraTransform: matrix_float4x4) {
@@ -1024,6 +1197,58 @@ struct ARViewContainer: UIViewRepresentable {
         }
       } else { DispatchQueue.main.async { self.vm.bodyTrackingHint = "Session resumed, but config lost." } }
     }
+    
+    // Enhanced subject detection combining ARKit and Vision
+    private func updateSubjectDetection(frame: ARFrame) {
+        // Get ARKit body tracking bounds if available  
+        var arSubjectBounds: SubjectBounds? = nil
+        if let bodyAnchor = currentBodyAnchor, validateHumanBody(bodyAnchor) {
+            arSubjectBounds = SubjectDetectionService.shared.calculateARSubjectBounds(from: bodyAnchor)
+        } else if currentBodyAnchor != nil {
+            // Clear invalid body anchor
+            currentBodyAnchor = nil
+            print("Cleared invalid body anchor in updateSubjectDetection")
+        }
+        
+        // Perform Vision-based detection (throttled to avoid performance issues)
+        if frame.timestamp.truncatingRemainder(dividingBy: 0.5) < 0.1 { // Run every ~0.5 seconds
+            SubjectDetectionService.shared.detectHumanSubjects(
+                in: frame.capturedImage,
+                cameraTransform: frame.camera.transform
+            ) { [weak self] visionBounds in
+                guard let self = self else { return }
+                
+                // Combine ARKit and Vision data
+                let hybridBounds = SubjectDetectionService.shared.hybridSubjectDetection(
+                    arBounds: arSubjectBounds,
+                    visionBounds: visionBounds
+                )
+                
+                DispatchQueue.main.async {
+                    self.vm.currentSubjectBounds = hybridBounds
+                    
+                    // Update guidance box if active and subject moved significantly
+                    if let bounds = hybridBounds,
+                       let activeGuidance = self.vm.activeGuidanceBox,
+                       self.vm.isGuidanceActive {
+                        
+                        // Check if subject moved significantly (>10cm)
+                        let movement = simd_distance(bounds.center, activeGuidance.targetPosition)
+                        if movement > 0.1, let guidance = self.vm.latestStructuredGuidance {
+                            // Update guidance box position
+                            self.vm.activateGuidanceBox(for: guidance, subjectBounds: bounds)
+                        }
+                    }
+                }
+            }
+        } else if let arBounds = arSubjectBounds {
+            // Update with ARKit-only data when not running Vision
+            DispatchQueue.main.async {
+                self.vm.currentSubjectBounds = arBounds
+            }
+        }
+    }
+    
     private func syncBoxes(_ boxes: [PlacedBox]) { /* ... (Existing box syncing logic can be added here) ... */ }
   }
 }
@@ -1147,6 +1372,509 @@ struct StructuredGeminiResponse: Codable {
     let adjustments: DOFAdjustment
     let summary: String?
     let confidence: Double?
+}
+
+// MARK: - Subject Detection & Guidance Models
+struct SubjectBounds {
+    let center: SIMD3<Float>
+    let size: SIMD3<Float>
+    let confidence: Float
+    let detectionSource: DetectionSource
+}
+
+enum DetectionSource {
+    case arBodyTracking
+    case visionFramework
+    case hybrid
+}
+
+struct GuidanceBox {
+    let id: UUID
+    let targetPosition: SIMD3<Float>  // Keep for compatibility - will be calculated dynamically
+    let subjectRelativeOffset: SIMD3<Float>  // Offset from subject center
+    let size: SIMD3<Float>
+    let confidence: Float
+    let isActive: Bool
+    let createdAt: Date
+    
+    // Calculate current world position based on subject position
+    func currentWorldPosition(subjectCenter: SIMD3<Float>) -> SIMD3<Float> {
+        return subjectCenter + subjectRelativeOffset
+    }
+}
+
+// MARK: - Subject Detection Service
+class SubjectDetectionService {
+    static let shared = SubjectDetectionService()
+    
+    private let humanDetectionRequest: VNDetectHumanRectanglesRequest
+    private let bodyPoseRequest: VNDetectHumanBodyPoseRequest
+    
+    private init() {
+        humanDetectionRequest = VNDetectHumanRectanglesRequest()
+        humanDetectionRequest.upperBodyOnly = false
+        
+        bodyPoseRequest = VNDetectHumanBodyPoseRequest()
+    }
+    
+    // Calculate subject bounds using ARKit body tracking
+    func calculateARSubjectBounds(from bodyAnchor: ARBodyAnchor) -> SubjectBounds? {
+        var jointPositions: [SIMD3<Float>] = []
+        
+        // Key joints for bounding box calculation (using correct ARKit joint names)
+        let keyJoints: [ARSkeleton.JointName] = [
+            .head,
+            .leftShoulder, .rightShoulder,
+            .leftHand, .rightHand,
+            .leftFoot, .rightFoot,
+            .root
+        ]
+        
+        // Collect all available joint positions
+        for jointName in keyJoints {
+            if let jointTransform = bodyAnchor.skeleton.modelTransform(for: jointName) {
+                let worldPosition = (bodyAnchor.transform * jointTransform).translation
+                jointPositions.append(worldPosition)
+            }
+        }
+        
+        guard !jointPositions.isEmpty else { return nil }
+        
+        // Calculate 3D bounding box
+        let minX = jointPositions.min(by: { $0.x < $1.x })?.x ?? 0
+        let maxX = jointPositions.max(by: { $0.x < $1.x })?.x ?? 0
+        let minY = jointPositions.min(by: { $0.y < $1.y })?.y ?? 0
+        let maxY = jointPositions.max(by: { $0.y < $1.y })?.y ?? 0
+        let minZ = jointPositions.min(by: { $0.z < $1.z })?.z ?? 0
+        let maxZ = jointPositions.max(by: { $0.z < $1.z })?.z ?? 0
+        
+        // Add padding for human body volume (adaptive based on detected joints)
+        let paddingFactor: Float = 0.4 // 40% padding to account for body volume beyond joints
+        let width = (maxX - minX) * (1 + paddingFactor)
+        let height = (maxY - minY) * (1 + paddingFactor)
+        let depth = (maxZ - minZ) * (1 + paddingFactor)
+        
+        // Ensure minimum realistic human dimensions
+        let minWidth: Float = 0.5  // 50cm minimum width
+        let minHeight: Float = 1.4 // 140cm minimum height
+        let minDepth: Float = 0.4  // 40cm minimum depth
+        
+        let finalWidth = max(width, minWidth)
+        let finalHeight = max(height, minHeight)
+        let finalDepth = max(depth, minDepth)
+        
+        let center = SIMD3<Float>(
+            (minX + maxX) / 2,
+            (minY + maxY) / 2,
+            (minZ + maxZ) / 2
+        )
+        
+        let size = SIMD3<Float>(finalWidth, finalHeight, finalDepth)
+        
+        // Calculate confidence based on number of visible joints
+        let confidence = Float(jointPositions.count) / Float(keyJoints.count)
+        
+        return SubjectBounds(
+            center: center,
+            size: size,
+            confidence: confidence,
+            detectionSource: .arBodyTracking
+        )
+    }
+    
+    // Enhanced ML-based human detection using Vision framework
+    func detectHumanSubjects(in pixelBuffer: CVPixelBuffer, cameraTransform: simd_float4x4, completion: @escaping ([SubjectBounds]) -> Void) {
+        let requestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
+        
+        let request = VNDetectHumanRectanglesRequest { [weak self] request, error in
+            guard let self = self, error == nil else {
+                completion([])
+                return
+            }
+            
+            var subjects: [SubjectBounds] = []
+            
+            if let observations = request.results as? [VNHumanObservation] {
+                for observation in observations {
+                    // Convert 2D bounding box to 3D estimate
+                    if let subjectBounds = self.estimate3DBoundsFromVision(
+                        observation: observation,
+                        cameraTransform: cameraTransform
+                    ) {
+                        subjects.append(subjectBounds)
+                    }
+                }
+            }
+            
+            completion(subjects)
+        }
+        request.upperBodyOnly = false
+        
+        do {
+            try requestHandler.perform([request])
+        } catch {
+            print("Vision request failed: \(error)")
+            completion([])
+        }
+    }
+    
+    private func estimate3DBoundsFromVision(observation: VNHumanObservation, cameraTransform: simd_float4x4) -> SubjectBounds? {
+        // This is a simplified 3D estimation - in a real implementation, you'd use
+        // depth information, camera intrinsics, and ML models for better accuracy
+        
+        let boundingBox = observation.boundingBox
+        let confidence = observation.confidence
+        
+        // Estimate depth based on bounding box size (larger = closer)
+        let estimatedDepth: Float = 2.0 / Float(boundingBox.height) // Rough heuristic
+        
+        // Convert normalized coordinates to world space (simplified)
+        let centerX = Float(boundingBox.midX - 0.5) * estimatedDepth
+        let centerY = Float(boundingBox.midY - 0.5) * estimatedDepth
+        let centerZ = -estimatedDepth // Forward from camera
+        
+        // Transform to world coordinates
+        let cameraSpacePosition = SIMD4<Float>(centerX, centerY, centerZ, 1.0)
+        let worldPositionVec4 = cameraTransform * cameraSpacePosition
+        let worldPosition = SIMD3<Float>(worldPositionVec4.x, worldPositionVec4.y, worldPositionVec4.z)
+        
+        // Estimate size based on typical human proportions
+        let estimatedWidth = Float(boundingBox.width) * estimatedDepth * 0.8
+        let estimatedHeight = Float(boundingBox.height) * estimatedDepth * 0.9
+        let estimatedDepthSize: Float = 0.4 // Default human depth
+        
+        return SubjectBounds(
+            center: worldPosition,
+            size: SIMD3<Float>(estimatedWidth, estimatedHeight, estimatedDepthSize),
+            confidence: confidence,
+            detectionSource: .visionFramework
+        )
+    }
+    
+    // Combine ARKit and Vision detection for better accuracy
+    func hybridSubjectDetection(arBounds: SubjectBounds?, visionBounds: [SubjectBounds]) -> SubjectBounds? {
+        guard let arBounds = arBounds else {
+            return visionBounds.first // Fall back to Vision if no ARKit data
+        }
+        
+        if visionBounds.isEmpty {
+            return arBounds // Use ARKit if no Vision data
+        }
+        
+        // Find closest Vision detection to ARKit bounds
+        let closestVision = visionBounds.min { bounds1, bounds2 in
+            let dist1 = simd_distance(bounds1.center, arBounds.center)
+            let dist2 = simd_distance(bounds2.center, arBounds.center)
+            return dist1 < dist2
+        }
+        
+        guard let vision = closestVision else { return arBounds }
+        
+        // Combine data - use ARKit position (more accurate) with Vision size refinement
+        let hybridConfidence = (arBounds.confidence + vision.confidence) / 2
+        
+        // Weight the size based on confidence
+        let arWeight = arBounds.confidence
+        let visionWeight = vision.confidence
+        let totalWeight = arWeight + visionWeight
+        
+        let hybridSize = SIMD3<Float>(
+            (arBounds.size.x * arWeight + vision.size.x * visionWeight) / totalWeight,
+            (arBounds.size.y * arWeight + vision.size.y * visionWeight) / totalWeight,
+            (arBounds.size.z * arWeight + vision.size.z * visionWeight) / totalWeight
+        )
+        
+        return SubjectBounds(
+            center: arBounds.center, // Trust ARKit position more
+            size: hybridSize,
+            confidence: hybridConfidence,
+            detectionSource: .hybrid
+        )
+    }
+}
+
+// SIMD4 extension for xyz access
+extension SIMD4 where Scalar == Float {
+    var xyz: SIMD3<Float> {
+        return SIMD3<Float>(x, y, z)
+    }
+}
+
+// MARK: - Guidance Box Service
+class GuidanceBoxService {
+    static let shared = GuidanceBoxService()
+    
+    private init() {}
+    
+    // Calculate subject-relative offset instead of absolute world position
+    func calculateSubjectRelativeOffset(
+        currentSubjectBounds: SubjectBounds,
+        recommendations: DOFAdjustment,
+        cameraTransform: simd_float4x4
+    ) -> SIMD3<Float> {
+        
+        // Use subject-relative vectors for positioning
+        // This ensures the box follows the subject as they move
+        let subjectRight = SIMD3<Float>(1.0, 0.0, 0.0)    // X-axis: left/right
+        let subjectUp = SIMD3<Float>(0.0, 1.0, 0.0)       // Y-axis: up/down
+        let subjectForward = SIMD3<Float>(0.0, 0.0, -1.0) // Z-axis: forward/back
+        
+        // Start with zero offset (box centered on subject)
+        var relativeOffset = SIMD3<Float>(0, 0, 0)
+        
+        // Apply translation adjustments as offsets from subject center
+        let translation = recommendations.translation
+        
+        // X-axis (left/right)
+        if let xMagnitude = translation.x.magnitude, xMagnitude > 0 {
+            let direction: Float = translation.x.direction == "right" ? 1.0 : -1.0
+            relativeOffset += subjectRight * Float(xMagnitude) * direction
+        }
+        
+        // Y-axis (up/down)
+        if let yMagnitude = translation.y.magnitude, yMagnitude > 0 {
+            let direction: Float = translation.y.direction == "up" ? 1.0 : -1.0
+            relativeOffset += subjectUp * Float(yMagnitude) * direction
+        }
+        
+        // Z-axis (forward/back)
+        if let zMagnitude = translation.z.magnitude, zMagnitude > 0 {
+            let direction: Float = translation.z.direction == "forward" ? 1.0 : -1.0
+            relativeOffset += subjectForward * Float(zMagnitude) * direction
+        }
+        
+        return relativeOffset
+    }
+    
+    // Create guidance box with adaptive sizing and subject-relative offset
+    func createGuidanceBox(
+        relativeOffset: SIMD3<Float>,
+        subjectBounds: SubjectBounds,
+        recommendations: DOFAdjustment
+    ) -> GuidanceBox {
+        
+        // Use subject bounds size with generous expansion to ensure it fits the subject
+        let expansionFactor: Float = 1.3 // 30% larger to ensure subject fits comfortably
+        let guidanceSize = subjectBounds.size * expansionFactor
+        
+        // Ensure minimum realistic human dimensions for visibility
+        let minWidth: Float = 0.6   // 60cm minimum width
+        let minHeight: Float = 1.5  // 150cm minimum height  
+        let minDepth: Float = 0.5   // 50cm minimum depth
+        
+        let finalSize = SIMD3<Float>(
+            max(guidanceSize.x, minWidth),
+            max(guidanceSize.y, minHeight),
+            max(guidanceSize.z, minDepth)
+        )
+        
+        // Calculate initial target position for compatibility
+        let initialTargetPosition = subjectBounds.center + relativeOffset
+        
+        return GuidanceBox(
+            id: UUID(),
+            targetPosition: initialTargetPosition,
+            subjectRelativeOffset: relativeOffset,
+            size: finalSize,
+            confidence: subjectBounds.confidence,
+            isActive: true,
+            createdAt: Date()
+        )
+    }
+}
+
+// MARK: - RealityKit Guidance Visualization
+class GuidanceBoxRenderer {
+    static let shared = GuidanceBoxRenderer()
+    
+    private var guidanceAnchor: AnchorEntity?
+    private var boxEntity: ModelEntity?
+    private var currentGuidanceBox: GuidanceBox?
+    
+    private init() {}
+    
+    func createGuidanceBoxEntity(guidanceBox: GuidanceBox) -> ModelEntity {
+        // Create wireframe box mesh
+        let size = guidanceBox.size
+        
+        // Create box mesh with wireframe material
+        let boxMesh = MeshResource.generateBox(
+            width: size.x,
+            height: size.y,
+            depth: size.z
+        )
+        
+        // Create semi-transparent green material for better visibility
+        var transparentMaterial = UnlitMaterial(color: UIColor(red: 0, green: 1, blue: 0, alpha: 0.2))
+        transparentMaterial.blending = .transparent(opacity: 0.2)
+        
+        // Create main box with semi-transparent material
+        let boxEntity = ModelEntity(mesh: boxMesh, materials: [transparentMaterial])
+        
+        // Create wireframe edges manually for better visibility (also semi-transparent)
+        let wireframeThickness: Float = 0.03 // Increased thickness for better visibility
+        let edgeColor = UIColor(red: 0, green: 1, blue: 0, alpha: 0.8) // Semi-transparent bright green
+        
+        // Create 12 edge lines for the box wireframe
+        let edges = createWireframeEdges(size: size, thickness: wireframeThickness, color: edgeColor)
+        for edge in edges {
+            boxEntity.addChild(edge)
+        }
+        
+        return boxEntity
+    }
+    
+    private func createWireframeEdges(size: SIMD3<Float>, thickness: Float, color: UIColor) -> [ModelEntity] {
+        var edges: [ModelEntity] = []
+        var material = UnlitMaterial(color: color)
+        if color.cgColor.alpha < 1.0 {
+            material.blending = .transparent(opacity: .init(floatLiteral: Float(color.cgColor.alpha)))
+        }
+        
+        let halfWidth = size.x / 2
+        let halfHeight = size.y / 2
+        let halfDepth = size.z / 2
+        
+        // Define the 8 corners of the box
+        let corners: [SIMD3<Float>] = [
+            SIMD3(-halfWidth, -halfHeight, -halfDepth), // 0: bottom-front-left
+            SIMD3( halfWidth, -halfHeight, -halfDepth), // 1: bottom-front-right
+            SIMD3( halfWidth,  halfHeight, -halfDepth), // 2: top-front-right
+            SIMD3(-halfWidth,  halfHeight, -halfDepth), // 3: top-front-left
+            SIMD3(-halfWidth, -halfHeight,  halfDepth), // 4: bottom-back-left
+            SIMD3( halfWidth, -halfHeight,  halfDepth), // 5: bottom-back-right
+            SIMD3( halfWidth,  halfHeight,  halfDepth), // 6: top-back-right
+            SIMD3(-halfWidth,  halfHeight,  halfDepth)  // 7: top-back-left
+        ]
+        
+        // Define the 12 edges of the box (connecting corners)
+        let edgeConnections: [(Int, Int)] = [
+            // Bottom face (y = -halfHeight)
+            (0, 1), (1, 5), (5, 4), (4, 0),
+            // Top face (y = +halfHeight)
+            (3, 2), (2, 6), (6, 7), (7, 3),
+            // Vertical edges
+            (0, 3), (1, 2), (5, 6), (4, 7)
+        ]
+        
+        // Create edge lines
+        for (start, end) in edgeConnections {
+            let startPos = corners[start]
+            let endPos = corners[end]
+            let center = (startPos + endPos) / 2
+            
+            // Calculate edge dimensions
+            let dx = abs(endPos.x - startPos.x)
+            let dy = abs(endPos.y - startPos.y)
+            let dz = abs(endPos.z - startPos.z)
+            
+            // Create edge mesh with appropriate dimensions
+            let edgeMesh: MeshResource
+            if dx > 0.01 { // Horizontal edge along X
+                edgeMesh = MeshResource.generateBox(width: dx, height: thickness, depth: thickness)
+            } else if dy > 0.01 { // Vertical edge along Y
+                edgeMesh = MeshResource.generateBox(width: thickness, height: dy, depth: thickness)
+            } else { // Edge along Z
+                edgeMesh = MeshResource.generateBox(width: thickness, height: thickness, depth: dz)
+            }
+            
+            let edgeEntity = ModelEntity(mesh: edgeMesh, materials: [material])
+            edgeEntity.position = center
+            
+            edges.append(edgeEntity)
+        }
+        
+        return edges
+    }
+    
+    func showGuidanceBox(_ guidanceBox: GuidanceBox, in arView: ARView) {
+        print("🎯 GuidanceBoxRenderer.showGuidanceBox called")
+        print("   Target Position: \(guidanceBox.targetPosition)")
+        print("   Relative Offset: \(guidanceBox.subjectRelativeOffset)")
+        print("   Size: \(guidanceBox.size)")
+        
+        // Store current guidance box for position updates
+        currentGuidanceBox = guidanceBox
+        
+        // Remove existing guidance
+        hideGuidanceBox(in: arView)
+        
+        // Create new guidance anchor at initial position
+        guidanceAnchor = AnchorEntity(world: guidanceBox.targetPosition)
+        print("   ✅ Created anchor at world position: \(guidanceBox.targetPosition)")
+        
+        // Create box entity
+        boxEntity = createGuidanceBoxEntity(guidanceBox: guidanceBox)
+        print("   ✅ Created box entity")
+        
+        if let anchor = guidanceAnchor, let entity = boxEntity {
+            anchor.addChild(entity)
+            arView.scene.addAnchor(anchor)
+            print("   ✅ Added box to AR scene")
+            
+            // Add subtle scale for visibility
+            entity.transform.scale = SIMD3<Float>(1.0, 1.0, 1.0)
+            
+            // Verify anchor is in scene
+            if arView.scene.anchors.contains(where: { $0 === anchor }) {
+                print("   ✅ Confirmed: Anchor is in AR scene")
+            } else {
+                print("   ❌ Error: Anchor not found in AR scene after adding")
+            }
+        } else {
+            print("   ❌ Error: Failed to create anchor or entity")
+        }
+    }
+    
+    func hideGuidanceBox(in arView: ARView) {
+        if let anchor = guidanceAnchor {
+            arView.scene.removeAnchor(anchor)
+            guidanceAnchor = nil
+            boxEntity = nil
+            currentGuidanceBox = nil
+        }
+    }
+    
+    func updateGuidanceBox(_ guidanceBox: GuidanceBox, in arView: ARView) {
+        guard let anchor = guidanceAnchor, let entity = boxEntity else {
+            // No existing guidance, create new one
+            showGuidanceBox(guidanceBox, in: arView)
+            return
+        }
+        
+        // Update position smoothly
+        let currentTransform = anchor.transform
+        let targetTransform = Transform(
+            scale: currentTransform.scale,
+            rotation: currentTransform.rotation,
+            translation: guidanceBox.targetPosition
+        )
+        
+        // Animate to new position
+        anchor.move(to: targetTransform, relativeTo: nil, duration: 0.5)
+    }
+    
+    // Update box position based on current subject position
+    func updateBoxPositionForSubject(subjectBounds: SubjectBounds, in arView: ARView) {
+        guard let guidanceBox = currentGuidanceBox,
+              let anchor = guidanceAnchor else {
+            return
+        }
+        
+        // Calculate new world position based on current subject center and stored offset
+        let newWorldPosition = guidanceBox.currentWorldPosition(subjectCenter: subjectBounds.center)
+        
+        // Update position smoothly
+        let currentTransform = anchor.transform
+        let targetTransform = Transform(
+            scale: currentTransform.scale,
+            rotation: currentTransform.rotation,
+            translation: newWorldPosition
+        )
+        
+        // Animate to new position (faster animation for real-time tracking)
+        anchor.move(to: targetTransform, relativeTo: nil, duration: 0.2)
+    }
 }
 
 // MARK: - Potential File: Services/APIService.swift
@@ -1871,6 +2599,29 @@ extension simd_quatf {
         } else {
             self = simd_quatf(angle: angle, axis: normalize(axis))
         }
+    }
+}
+
+// MARK: - SIMD3 Arithmetic Extensions
+extension SIMD3 where Scalar == Float {
+    static func +(lhs: SIMD3<Float>, rhs: SIMD3<Float>) -> SIMD3<Float> {
+        return SIMD3<Float>(lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z)
+    }
+    
+    static func -(lhs: SIMD3<Float>, rhs: SIMD3<Float>) -> SIMD3<Float> {
+        return SIMD3<Float>(lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z)
+    }
+    
+    static func *(lhs: SIMD3<Float>, rhs: Float) -> SIMD3<Float> {
+        return SIMD3<Float>(lhs.x * rhs, lhs.y * rhs, lhs.z * rhs)
+    }
+    
+    static func +=(lhs: inout SIMD3<Float>, rhs: SIMD3<Float>) {
+        lhs = lhs + rhs
+    }
+    
+    static func -=(lhs: inout SIMD3<Float>, rhs: SIMD3<Float>) {
+        lhs = lhs - rhs
     }
 }
 
