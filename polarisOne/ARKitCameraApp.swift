@@ -61,20 +61,6 @@ final class ARViewModel: ObservableObject {
   @Published var generatedImage: UIImage?
   @Published var isGeneratingPhoto: Bool = false
 
-  // --- Enhanced Calibration State ---
-  @Published var isCalibratingHeight: Bool = false
-  @Published var calibrationInstruction: String = "Tap 'Start Calibration' for better height accuracy."
-  @Published var triggerFloorMeasurement: Bool = false
-
-  var calibratedFloorY: Float? = nil
-  var isCalibrated: Bool = false
-  var heightMeasurements: [Float] = []
-  let maxMeasurements = 5
-  @Published var calibrationResetTrigger: Bool = false
-
-  // --- Automatic Reset Failsafe ---
-  @Published var automaticResetCooldownActive: Bool = false
-  private var automaticResetTimer: Timer?
   
   // --- Settings ---
   @Published var showDetailedMetrics: Bool = true
@@ -93,7 +79,8 @@ final class ARViewModel: ObservableObject {
     guard let roll = cameraRoll, let pitch = cameraPitch, let yaw = cameraYaw else { return "Orientation: N/A" }
     // ARCamera.eulerAngles provides: pitch (around X), yaw (around Y), roll (around Z).
     // Standard display order is often Roll, Pitch, Yaw.
-    return String(format: "R:%.0f° P:%.0f° Y:%.0f°", roll * 180 / .pi, pitch * 180 / .pi, yaw * 180 / .pi)
+    // Note: Negating roll to match expected convention (positive roll = clockwise when looking forward)
+    return String(format: "R:%.0f° P:%.0f° Y:%.0f°", -roll * 180 / .pi, pitch * 180 / .pi, yaw * 180 / .pi)
   }
   var fieldOfViewDegString: String {
     guard let fov = fieldOfViewHorizontalDeg else { return "FOV H: N/A" }
@@ -107,76 +94,17 @@ final class ARViewModel: ObservableObject {
     guard let temp = ambientColorTemperatureKelvin else { return "Color K: N/A" }
     return String(format: "Color K: %.0f", temp)
   }
+  
+  // Store the latest structured response for potential UI use
+  @Published var latestStructuredGuidance: StructuredGeminiResponse? = nil
 
 
-  func startHeightCalibration() {
-    automaticResetTimer?.invalidate()
-    automaticResetCooldownActive = false
-    isCalibrated = false
-    calibratedFloorY = nil
-    isCalibratingHeight = true
-    heightMeasurements.removeAll()
-    calibrationInstruction = "Point camera at floor. Tap 'Measure Floor' \(maxMeasurements) times."
-    bodyTrackingHint = ""
-    generalCameraHeight = "Cam Height: Calibrating..."
-  }
-
-  func requestFloorMeasurement() {
-    guard isCalibratingHeight else { return }
-    calibrationInstruction = "Getting measurement... Hold steady."
-    triggerFloorMeasurement = true
-  }
-
-  func processTakenFloorMeasurement(cameraY: Float) {
-    guard isCalibratingHeight else { return }
-    heightMeasurements.append(cameraY)
-    let measurementsTaken = heightMeasurements.count
-    if measurementsTaken < maxMeasurements {
-      calibrationInstruction = "Measurement \(measurementsTaken)/\(maxMeasurements) taken. Tap 'Measure Floor' again."
-    } else {
-      calibratedFloorY = heightMeasurements.reduce(0, +) / Float(heightMeasurements.count)
-      isCalibratingHeight = false
-      isCalibrated = true
-      calibrationInstruction = "Floor calibrated at Y: \(String(format: "%.2f", calibratedFloorY!))m. Height is now relative to this."
-      bodyTrackingHint = "Calibration Complete!"
-    }
-  }
-
-  func resetCalibration(triggeredAutomatically: Bool = false) {
-    isCalibratingHeight = false
-    heightMeasurements.removeAll()
-    isCalibrated = false
-    calibratedFloorY = nil
-    if triggeredAutomatically {
-        calibrationInstruction = "Height anomaly detected. Calibration reset. Please recalibrate floor."
-        bodyTrackingHint = "AUTO-RESET: Height issue. Recalibrate floor."
-        generalCameraHeight = "Cam Height: N/A (Auto-Reset)"
-        automaticResetCooldownActive = true
-        automaticResetTimer?.invalidate()
-        automaticResetTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in
-            self?.automaticResetCooldownActive = false
-            if !(self?.isCalibratingHeight ?? false) && !(self?.isCalibrated ?? false) {
-                 self?.calibrationInstruction = "Tap 'Start Calibration' for better height accuracy."
-            }
-            print("Automatic reset cooldown finished.")
-        }
-    } else {
-        automaticResetTimer?.invalidate()
-        automaticResetCooldownActive = false
-        calibrationInstruction = "Calibration Reset. Tap 'Start Calibration' for accuracy."
-        bodyTrackingHint = "Calibration has been reset manually."
-        generalCameraHeight = "Cam Height: N/A (Recalibrate)"
-    }
-    calibrationResetTrigger.toggle()
-  }
 
   private func getFinalCameraHeightForPrompt() -> (stringValue: String, numericValue: Double?) {
       var cameraHeightStringValue: String = "N/A"
       var numericHeightValue: Double? = nil
       let fullHeightString = generalCameraHeight
-      if fullHeightString.lowercased().contains("calibrating") || fullHeightString.lowercased().contains("auto-reset") {
-          cameraHeightStringValue = "Calibrating/Resetting"
-      } else if fullHeightString.lowercased().contains("n/a") {
+      if fullHeightString.lowercased().contains("n/a") {
           cameraHeightStringValue = "N/A"
       } else {
           let components = fullHeightString.components(separatedBy: .whitespaces)
@@ -191,224 +119,345 @@ final class ARViewModel: ObservableObject {
       }
       var finalPromptString = cameraHeightStringValue
       if let numHeight = numericHeightValue, numHeight < -0.05 {
-          if generalCameraHeight.lowercased().contains("below calib. floor") || generalCameraHeight.lowercased().contains("low?") {
+          if generalCameraHeight.lowercased().contains("low?") {
               finalPromptString = "\(cameraHeightStringValue)m (potentially low)"
-          } else if numHeight < -0.19 && (generalCameraHeight.lowercased().contains("origin") || !isCalibrated) {
+          } else if numHeight < -0.19 && generalCameraHeight.lowercased().contains("origin") {
               finalPromptString = "approx. 0m (origin likely high or detection issue)"
           } else {
               finalPromptString = "\(cameraHeightStringValue)m"
           }
-      } else if cameraHeightStringValue == "N/A" || cameraHeightStringValue == "Calibrating/Resetting" {
-          finalPromptString = "unknown (AR not ready/calibrating/reset)"
+      } else if cameraHeightStringValue == "N/A" {
+          finalPromptString = "unknown (AR not ready)"
       } else if numericHeightValue != nil {
            finalPromptString = "\(cameraHeightStringValue)m"
       }
       return (finalPromptString, numericHeightValue)
   }
-
-  func captureAndAnalyze() {
-    guard let arView = ARMeshExporter.arView else { return }
+  
+  func capturePhotoWithMetrics() {
+    guard let arView = ARMeshExporter.arView else {
+      self.bodyTrackingHint = "AR system not ready for capture."
+      return
+    }
+    
     isCapturing = true
+    
+    // Capture current AR view
     let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
-    let currentARImage = renderer.image { ctx in
+    let capturedImage = renderer.image { ctx in
       arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
     }
-
+    
+    // Get current metrics
     let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
     let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
     
-    let rollDeg = cameraRoll != nil ? String(format: "%.1f", cameraRoll! * 180 / .pi) : "N/A"
+    // Extract eyeline distance from cameraHeightRelativeToEyes
+    var eyelineDistance = ""
+    if cameraHeightRelativeToEyes.contains("Cam") && cameraHeightRelativeToEyes.contains("m") {
+      let components = cameraHeightRelativeToEyes.components(separatedBy: " ")
+      if components.count >= 3 {
+        eyelineDistance = components[2].replacingOccurrences(of: "m", with: "")
+      }
+    }
+    
+    // Create metadata with all current metrics
+    let metadata = ReferenceImageMetadata(
+      distanceFromCamera: distanceStringValue,
+      distanceBelowEyeline: eyelineDistance,
+      cameraHeight: finalCameraHeightForPrompt.replacingOccurrences(of: "m", with: "").replacingOccurrences(of: " (unknown AR not ready)", with: ""),
+      cameraHeightRelativeToEyes: cameraHeightRelativeToEyes,
+      visibleBodyParts: visibleBodyPartsInfo,
+      detectedSubjectCount: "\(detectedSubjectCount)",
+      cameraRollDeg: cameraRoll != nil ? String(format: "%.1f", -cameraRoll! * 180 / .pi) : "N/A",
+      cameraPitchDeg: cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A",
+      cameraYawDeg: cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A",
+      cameraFOVHDeg: fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A",
+      ambientLux: ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A",
+      colorTempK: ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A",
+      captureDate: Date()
+    )
+    
+    // Save to reference images
+    if let savedRef = ReferenceImageManager.shared.saveImage(capturedImage, metadata: metadata) {
+      DispatchQueue.main.async {
+        self.selectedReferenceImage = savedRef
+        self.bodyTrackingHint = "Photo captured with metrics and saved to library"
+        self.isCapturing = false
+        
+        // Notify reference view model to reload if it exists
+        NotificationCenter.default.post(name: Notification.Name("RefreshReferenceImages"), object: nil)
+      }
+    } else {
+      DispatchQueue.main.async {
+        self.bodyTrackingHint = "Failed to save captured photo"
+        self.isCapturing = false
+      }
+    }
+  }
+  
+  func analyzeScene() {
+    guard let arView = ARMeshExporter.arView else {
+      self.bodyTrackingHint = "AR system not ready."
+      return
+    }
+    
+    isCapturing = true
+    
+    // Capture current AR view
+    let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
+    let currentImage = renderer.image { ctx in
+      arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
+    }
+    
+    // Get reference image if available
+    let referenceImage: UIImage
+    let hasReference = selectedReferenceImage?.image != nil
+    
+    if let refImageContainer = selectedReferenceImage, let refImage = refImageContainer.image {
+      referenceImage = refImage
+    } else {
+      // Use current image as both reference and current if no reference is set
+      referenceImage = currentImage
+    }
+    
+    // Prepare metrics
+    let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
+    let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
+    
+    let rollDeg = cameraRoll != nil ? String(format: "%.1f", -cameraRoll! * 180 / .pi) : "N/A"
     let pitchDeg = cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A"
     let yawDeg = cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A"
     let orientationPrompt = "R:\(rollDeg)°, P:\(pitchDeg)°, Y:\(yawDeg)°"
-
-
-    let prompt =
-    """
-    Act like an expert ARKit scene analyst. I will provide a photo of the current AR scene (it will be sent as the first image, and also duplicated as the second image in the payload, please use the first one), and some measured values about the subject and camera. Please provide a concise analysis (≤80 words) of the scene, including any suggestions for improving the photo or AR experience. List any detected issues or tips for better results.\n
-    Scene metrics:
-    - Subject distance: \(distanceStringValue) m
-    - Camera height: \(finalCameraHeightForPrompt)
-    - Height relative to eyes: \(cameraHeightRelativeToEyes)
-    - Visible body parts: \(visibleBodyPartsInfo)
-    - Detected subject count: \(detectedSubjectCount)
-    - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
-    - Camera Horizontal FOV: \(self.fieldOfViewDegString)
-    - Ambient Light: \(self.ambientLuxString)
-    - Color Temperature: \(self.colorTempKString)
-    """
+    
     var currentMetrics: [String: String] = [
         "distance_to_person_meters": distanceStringValue,
         "camera_height_meters": finalCameraHeightForPrompt,
         "camera_height_raw_string": generalCameraHeight,
         "camera_height_relative_to_eyes": cameraHeightRelativeToEyes,
         "visible_body_parts": visibleBodyPartsInfo,
-        "detected_subject_count": "\(detectedSubjectCount)"
+        "detected_subject_count": "\(detectedSubjectCount)",
+        "camera_roll_deg": rollDeg,
+        "camera_pitch_deg": pitchDeg,
+        "camera_yaw_deg": yawDeg,
+        "camera_fov_h_deg": fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A",
+        "ambient_lux": ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A",
+        "color_temp_k": ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A"
     ]
     
-    currentMetrics["camera_roll_deg"] = cameraRoll != nil ? String(format: "%.1f", cameraRoll! * 180 / .pi) : "N/A"
-    currentMetrics["camera_pitch_deg"] = cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A"
-    currentMetrics["camera_yaw_deg"] = cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A"
-    currentMetrics["camera_fov_h_deg"] = fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A"
-    currentMetrics["ambient_lux"] = ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A"
-    currentMetrics["color_temp_k"] = ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A"
+    // Build prompt based on whether we have a reference image
+    let prompt: String
+    
+    if hasReference, let refImageContainer = selectedReferenceImage {
+      // We have a reference image - provide comparison guidance
+      let refMeta = refImageContainer.metadata
+      let distCam = refMeta.distanceFromCamera.isEmpty ? "N/A" : "\(refMeta.distanceFromCamera)m"
+      let camHeight = refMeta.cameraHeight.isEmpty ? "N/A" : "\(refMeta.cameraHeight)m"
+      let belowEyeline = refMeta.distanceBelowEyeline.isEmpty ? "N/A" : "\(refMeta.distanceBelowEyeline)m (camera below subject's eyes)"
+      
+      let photo1Details = """
+      - Subject distance from camera: \(distCam)
+      - Camera height: \(camHeight)
+      - Camera position relative to subject's eyeline: \(belowEyeline)
+      - Visible body parts: \(refMeta.visibleBodyParts.isEmpty ? "N/A" : refMeta.visibleBodyParts)
+      - Detected subject count: \(refMeta.detectedSubjectCount.isEmpty ? "N/A" : refMeta.detectedSubjectCount)
+      - Camera Orientation (Roll, Pitch, Yaw): R:\(refMeta.cameraRollDeg)°, P:\(refMeta.cameraPitchDeg)°, Y:\(refMeta.cameraYawDeg)°
+      - Camera Horizontal FOV: \(refMeta.cameraFOVHDeg.isEmpty ? "N/A" : "\(refMeta.cameraFOVHDeg)°")
+      - Ambient Light: \(refMeta.ambientLux.isEmpty ? "N/A" : "\(refMeta.ambientLux) lux")
+      - Color Temperature: \(refMeta.colorTempK.isEmpty ? "N/A" : "\(refMeta.colorTempK)K")
+      """
+      
+      let photo2Details = """
+      - Subject distance from camera: \(distanceStringValue.isEmpty ? "N/A" : "\(distanceStringValue)m")
+      - Camera height: \(finalCameraHeightForPrompt)
+      - Camera height relative to subject's eyes: \(cameraHeightRelativeToEyes)
+      - Visible body parts: \(visibleBodyPartsInfo)
+      - Detected subject count: \(detectedSubjectCount)
+      - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
+      - Camera Horizontal FOV: \(self.fieldOfViewDegString)
+      - Ambient Light: \(self.ambientLuxString)
+      - Color Temperature: \(self.colorTempKString)
+      """
+      
+      prompt = """
+      You are an expert photography assistant. Your goal is to help me adjust my iPhone camera position and angle to make the live camera view (Photo 2) look as close as possible to a reference image (Photo 1).
 
+      I will provide two images:
+      1. Photo 1: The reference image I want to emulate. (This will be the first image in the payload)
+      2. Photo 2: The current live view from my iPhone camera. (This will be the second image in the payload)
+
+      Reference Photo Details (Photo 1):
+      \(photo1Details)
+
+      Current Scene Details (Photo 2):
+      \(photo2Details)
+
+      Based on these two images and their details, provide precise directives to adjust my iPhone (Photo 2) to better match Photo 1's perspective, angle, and subject framing.
+      
+      IMPORTANT: Respond ONLY with valid JSON in the following exact format:
+      
+      {
+        "adjustments": {
+          "translation": {
+            "x": {
+              "direction": "left|right|no change",
+              "magnitude": 0.5,
+              "unit": "m",
+              "description": "Move 0.5m left"
+            },
+            "y": {
+              "direction": "up|down|no change",
+              "magnitude": 0.2,
+              "unit": "m",
+              "description": "Move 0.2m up"
+            },
+            "z": {
+              "direction": "forward|back|no change",
+              "magnitude": 1.0,
+              "unit": "m",
+              "description": "Move 1.0m forward"
+            }
+          },
+          "rotation": {
+            "yaw": {
+              "direction": "left|right|no change",
+              "magnitude": 15,
+              "unit": "deg",
+              "description": "Turn 15° left"
+            },
+            "pitch": {
+              "direction": "up|down|no change",
+              "magnitude": 5,
+              "unit": "deg",
+              "description": "Tilt 5° up"
+            },
+            "roll": {
+              "direction": "clockwise|counter-clockwise|no change",
+              "magnitude": 0,
+              "unit": "deg",
+              "description": "No roll adjustment needed"
+            }
+          }
+        },
+        "summary": "Brief summary of key adjustments",
+        "confidence": 0.85
+      }
+      
+      Rules:
+      - For "no change" directions, set magnitude to 0 or null
+      - Use precise numeric values
+      - Keep descriptions concise
+      - Confidence is a value between 0 and 1
+      - Respond with ONLY the JSON, no additional text
+      """
+    } else {
+      // No reference image - just analyze the current scene
+      prompt = """
+      Act like an expert ARKit scene analyst and photography coach. I will provide a photo of the current AR scene and measured values about the subject and camera.
+      
+      Please provide a concise analysis (≤100 words) that includes:
+      1. Assessment of the current scene composition
+      2. Specific suggestions for improving the photo (positioning, angle, distance)
+      3. Any detected issues with tracking or visibility
+      4. Tips for better photo results
+      
+      Scene metrics:
+      - Subject distance: \(distanceStringValue) m
+      - Camera height: \(finalCameraHeightForPrompt)
+      - Height relative to eyes: \(cameraHeightRelativeToEyes)
+      - Visible body parts: \(visibleBodyPartsInfo)
+      - Detected subject count: \(detectedSubjectCount)
+      - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
+      - Camera Horizontal FOV: \(self.fieldOfViewDegString)
+      - Ambient Light: \(self.ambientLuxString)
+      - Color Temperature: \(self.colorTempKString)
+      """
+    }
+    
     Task {
       do {
-        let (directivesText, _) = try await APIService.shared.sendImageGenerationRequest(
-          referenceImage: currentARImage,
-          currentImage: currentARImage,
-          prompt: prompt,
-          additionalMetrics: currentMetrics
-        )
-        let apiResponse = APIResponse(response: "Scene Analysis:\n\(directivesText)")
-        await MainActor.run {
-          let viewModel = ResponsesViewModel()
-          viewModel.saveResponse(apiResponse)
-          isCapturing = false
-          showResponses = true
+        if hasReference {
+          // Use structured response for reference image comparison
+          let (structuredResponse, rawJSON) = try await APIService.shared.sendStructuredImageComparisonRequest(
+            referenceImage: referenceImage,
+            currentImage: currentImage,
+            prompt: prompt,
+            additionalMetrics: currentMetrics
+          )
+          
+          // Format the structured response into human-readable text
+          var formattedResponse = "Photo Guidance (6 DOF Adjustments):\n\n"
+          
+          // Translation adjustments
+          formattedResponse += "POSITION ADJUSTMENTS:\n"
+          formattedResponse += "• X-axis: \(structuredResponse.adjustments.translation.x.description)\n"
+          formattedResponse += "• Y-axis: \(structuredResponse.adjustments.translation.y.description)\n"
+          formattedResponse += "• Z-axis: \(structuredResponse.adjustments.translation.z.description)\n\n"
+          
+          // Rotation adjustments
+          formattedResponse += "ROTATION ADJUSTMENTS:\n"
+          formattedResponse += "• Yaw: \(structuredResponse.adjustments.rotation.yaw.description)\n"
+          formattedResponse += "• Pitch: \(structuredResponse.adjustments.rotation.pitch.description)\n"
+          formattedResponse += "• Roll: \(structuredResponse.adjustments.rotation.roll.description)\n"
+          
+          if let summary = structuredResponse.summary {
+            formattedResponse += "\nSUMMARY: \(summary)"
+          }
+          
+          if let confidence = structuredResponse.confidence {
+            formattedResponse += "\nConfidence: \(Int(confidence * 100))%"
+          }
+          
+          let apiResponse = APIResponse(response: formattedResponse)
+          
+          await MainActor.run {
+            let viewModel = ResponsesViewModel()
+            viewModel.saveResponse(apiResponse)
+            isCapturing = false
+            showResponses = true
+            
+            // Store the structured guidance for potential UI use
+            self.latestStructuredGuidance = structuredResponse
+            
+            // Show brief hint with key adjustment
+            var keyAdjustment = "Check responses for guidance"
+            if let summary = structuredResponse.summary {
+              keyAdjustment = String(summary.prefix(60)) + "..."
+            }
+            self.bodyTrackingHint = "Photo Guidance: \(keyAdjustment)"
+          }
+        } else {
+          // Use regular text response for scene analysis without reference
+          let (responseText, _) = try await APIService.shared.sendImageGenerationRequest(
+            referenceImage: referenceImage,
+            currentImage: currentImage,
+            prompt: prompt,
+            additionalMetrics: currentMetrics
+          )
+          
+          let apiResponse = APIResponse(response: "Scene Analysis:\n\(responseText)")
+          
+          await MainActor.run {
+            let viewModel = ResponsesViewModel()
+            viewModel.saveResponse(apiResponse)
+            isCapturing = false
+            showResponses = true
+            
+            // Show brief hint
+            let previewText = responseText.prefix(60)
+            self.bodyTrackingHint = "Scene Analysis: \(previewText)... (See Responses)"
+          }
         }
       } catch {
-        print("Error sending scene analysis request: \(error)")
+        print("Error sending analysis request: \(error)")
         await MainActor.run {
           isCapturing = false
-          self.bodyTrackingHint = "Scene analysis failed: \(error.localizedDescription)"
+          self.bodyTrackingHint = "Analysis failed: \(error.localizedDescription)"
         }
       }
     }
   }
 
-  func generateImprovedPhoto() {
-    guard let arView = ARMeshExporter.arView else {
-      print("ARView not available for image generation.")
-      self.bodyTrackingHint = "AR system not ready."
-      return
-    }
-    guard let refImageContainer = selectedReferenceImage, let photo1 = refImageContainer.image else {
-        print("Reference photo (Photo 1) is missing.")
-        self.bodyTrackingHint = "Please select a reference photo first."
-        return
-    }
-
-    isGeneratingPhoto = true
-
-    let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
-    let photo2 = renderer.image { ctx in
-      arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
-    }
-
-    let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
-    let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
-    
-    let rollDeg = cameraRoll != nil ? String(format: "%.1f", cameraRoll! * 180 / .pi) : "N/A"
-    let pitchDeg = cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A"
-    let yawDeg = cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A"
-    let orientationPrompt = "R:\(rollDeg)°, P:\(pitchDeg)°, Y:\(yawDeg)°"
-
-
-    let refMeta = refImageContainer.metadata
-    
-    let distCam = refMeta.distanceFromCamera.isEmpty ? "N/A" : "\(refMeta.distanceFromCamera)m"
-    let camHeight = refMeta.cameraHeight.isEmpty ? "N/A" : "\(refMeta.cameraHeight)m"
-    let belowEyeline = refMeta.distanceBelowEyeline.isEmpty ? "N/A" : "\(refMeta.distanceBelowEyeline)m (camera below subject's eyes)"
-    
-    let photo1Details = """
-    - Subject distance from camera: \(distCam)
-    - Camera height: \(camHeight)
-    - Camera position relative to subject's eyeline: \(belowEyeline)
-    """
-
-    let photo2Details = """
-    - Subject distance from camera: \(distanceStringValue.isEmpty ? "N/A" : "\(distanceStringValue)m")
-    - Camera height: \(finalCameraHeightForPrompt)
-    - Camera height relative to subject's eyes: \(cameraHeightRelativeToEyes)
-    - Visible body parts: \(visibleBodyPartsInfo)
-    - Detected subject count: \(detectedSubjectCount)
-    - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
-    - Camera Horizontal FOV: \(self.fieldOfViewDegString)
-    - Ambient Light: \(self.ambientLuxString)
-    - Color Temperature: \(self.colorTempKString)
-    """
-
-    let prompt = """
-    You are an expert photography assistant. Your goal is to help me adjust my iPhone camera position and angle to make the live camera view (Photo 2) look as close as possible to a reference image (Photo 1).
-
-    I will provide two images:
-    1. Photo 1: The reference image I want to emulate. (This will be the first image in the payload)
-    2. Photo 2: The current live view from my iPhone camera. (This will be the second image in the payload)
-
-    And I'll provide some technical details for both photos.
-
-    Reference Photo Details (Photo 1):
-    \(photo1Details)
-
-    Current Scene Details (Photo 2):
-    \(photo2Details)
-
-    Based on these two images and their details, provide very concise and precise directives (MAX 80 words total for all directives) to adjust my iPhone (Photo 2) to better match Photo 1's perspective, angle, and subject framing.
-    Output exactly six directives, one for each degree of freedom (DOF). If no change is needed for a DOF, state "no change" or "minimal change".
-    Use numeric values in meters (m) for translations and degrees (°) for rotations. Be specific.
-
-    Directives Format:
-    • X (Left/Right): Move ___ m left/right (or 'no change').
-    • Y (Up/Down): Move ___ m up/down (or 'no change').
-    • Z (Forward/Back): Move ___ m forward/back (or 'no change').
-    • Yaw (Pan Left/Right): Turn ___° left/right (or 'no change').
-    • Pitch (Tilt Up/Down): Tilt ___° up/down (or 'no change').
-    • Roll (Rotate CW/CCW): Roll ___° clockwise/counter-clockwise (or 'no change').
-
-    Optional: If a significant overall angle change is needed (e.g., from frontal to profile), add a brief "Angle Tip:" after the six directives.
-    Example response:
-    X (Left/Right): Move 0.1m right.
-    Y (Up/Down): Move 0.05m up.
-    Z (Forward/Back): Move 0.2m back.
-    Yaw (Pan Left/Right): Turn 5° left.
-    Pitch (Tilt Up/Down): Tilt 2° down.
-    Roll (Rotate CW/CCW): no change.
-    """
-
-    var currentMetrics: [String: String] = [
-        "distance_to_person_meters": distanceStringValue,
-        "camera_height_meters": finalCameraHeightForPrompt,
-        "camera_height_raw_string": generalCameraHeight,
-        "camera_height_relative_to_eyes": cameraHeightRelativeToEyes,
-        "visible_body_parts": visibleBodyPartsInfo,
-        "detected_subject_count": "\(detectedSubjectCount)"
-    ]
-    
-    currentMetrics["camera_roll_deg"] = cameraRoll != nil ? String(format: "%.1f", cameraRoll! * 180 / .pi) : "N/A"
-    currentMetrics["camera_pitch_deg"] = cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A"
-    currentMetrics["camera_yaw_deg"] = cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A"
-    currentMetrics["camera_fov_h_deg"] = fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A"
-    currentMetrics["ambient_lux"] = ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A"
-    currentMetrics["color_temp_k"] = ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A"
-
-
-    Task {
-        do {
-            let (directivesText, _) = try await APIService.shared.sendImageGenerationRequest(
-                referenceImage: photo1,
-                currentImage: photo2,
-                prompt: prompt,
-                additionalMetrics: currentMetrics
-            )
-            let apiResponse = APIResponse(response: "Photo Directives:\n\(directivesText)")
-            await MainActor.run {
-                let responsesVM = ResponsesViewModel()
-                responsesVM.saveResponse(apiResponse)
-                self.bodyTrackingHint = "Directives: \(directivesText.prefix(60))... (See Responses)"
-                self.isGeneratingPhoto = false
-                self.showResponses = true
-            }
-        } catch {
-            print("Error sending image guidance request: \(error.localizedDescription)")
-            await MainActor.run {
-                self.isGeneratingPhoto = false
-                self.bodyTrackingHint = "Guidance Gen failed: \(error.localizedDescription.prefix(50))..."
-            }
-        }
-    }
-  }
 }
 
 // MARK: - Potential File: Views/ContentView.swift
@@ -444,31 +493,6 @@ struct ContentView: View {
         //     Label("Box Placement", systemImage: "cube").font(.caption).padding(6).background(Color(.systemGray6)).cornerRadius(8)
         // }.padding(.bottom, 8)
         
-        VStack(alignment: .leading, spacing: 4) { // Reduced spacing
-            Button(action: { vm.resetCalibration(triggeredAutomatically: false) }) {
-                Label("Reset Calib", systemImage: "arrow.counterclockwise") // Shorter text
-                    .font(.caption2).padding(5).background(Color(.systemGray5)).cornerRadius(6) // Smaller padding
-            }
-            Text(vm.calibrationInstruction)
-                .font(.caption2).lineLimit(2).fixedSize(horizontal: false, vertical: true).padding(4) // Smaller padding
-                .background(
-                    Group {
-                        if vm.calibrationInstruction.lowercased().contains("anomaly") || vm.calibrationInstruction.lowercased().contains("auto-reset") { Color.orange.opacity(0.3) }
-                        else if vm.isCalibratingHeight || (!vm.isCalibrated && !vm.calibrationInstruction.lowercased().contains("complete")) { Color.yellow.opacity(0.3) }
-                        else if vm.calibrationInstruction.lowercased().contains("complete") || vm.calibrationInstruction.lowercased().contains("calibrated at") { Color.green.opacity(0.2) }
-                        else { Color.clear }
-                    }).cornerRadius(4)
-            if vm.isCalibratingHeight {
-                Button(action: { vm.requestFloorMeasurement() }) {
-                    Label("Measure (\(vm.heightMeasurements.count)/\(vm.maxMeasurements))", systemImage: "ruler.fill") // Shorter
-                }.font(.caption2).padding(5).background(Color.blue.opacity(0.3)).cornerRadius(6)
-                .disabled(vm.heightMeasurements.count >= vm.maxMeasurements)
-            } else if !vm.isCalibrated || vm.automaticResetCooldownActive {
-                Button(action: { vm.startHeightCalibration() }) {
-                    Label("Start Calib", systemImage: "target") // Shorter
-                }.font(.caption2).padding(5).background(Color.green.opacity(0.3)).cornerRadius(6)
-            }
-        }.padding(.bottom, 6)
 
         if !vm.bodyTrackingHint.isEmpty {
           Text(vm.bodyTrackingHint)
@@ -501,55 +525,45 @@ struct ContentView: View {
 
       VStack {
         Spacer()
-        // Generated image display can be smaller or conditional
-        // if let generatedImg = vm.generatedImage {
-        //     Image(uiImage: generatedImg)
-        //         .resizable().scaledToFit().frame(width: 80, height: 80, alignment: .center)
-        //         .clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray, lineWidth: 1))
-        //         .padding(.bottom, 5)
-        // }
-
-        HStack(spacing: 15) {
-          Spacer()
-          
+        
+        // Camera capture button - iPhone style
+        Button(action: { vm.capturePhotoWithMetrics() }) {
+          ZStack {
+            Circle()
+              .fill(Color.white)
+              .frame(width: 70, height: 70)
+            Circle()
+              .strokeBorder(Color.white, lineWidth: 3)
+              .frame(width: 80, height: 80)
+          }
+        }
+        .disabled(vm.isCapturing || vm.isGeneratingPhoto)
+        .opacity((vm.isCapturing || vm.isGeneratingPhoto) ? 0.5 : 1.0)
+        .padding(.bottom, 30)
+        
+        HStack(spacing: 20) {
           // Settings button
           Button(action: { vm.showSettings = true }) {
-            Image(systemName: "gear").font(.system(size: 20, weight: .semibold))
-              .padding(12).background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Settings")
+            Image(systemName: "gear").font(.system(size: 22, weight: .semibold))
+              .frame(width: 42, height: 42)
+              .background(.ultraThinMaterial, in: Circle())
+              .foregroundColor(.white)
           }
           
-          Button(action: { vm.captureAndAnalyze() }) {
-            Image(systemName: "wand.and.stars").font(.system(size: 20, weight: .semibold)) // Smaller icon
-              .padding(12).background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Analyze Scene (Gemini)") // Smaller padding
-          }
-          .disabled(vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight)
-          .opacity((vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight) ? 0.5 : 1.0)
-           
-          Button(action: {
-            if vm.selectedReferenceImage == nil { vm.bodyTrackingHint = "Error: Set reference photo first."; return }
-            if !vm.isCalibrated && !vm.generalCameraHeight.lowercased().contains("floor") && !vm.generalCameraHeight.lowercased().contains("plane") {
-                vm.bodyTrackingHint = "Calibrate floor first for accurate photo guidance."
-                return
-            }
-            vm.generateImprovedPhoto()
-          }) {
-            Image(systemName: "camera.filters").font(.system(size: 20, weight: .semibold))
-              .padding(12).background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Get Photo Guidance")
-          }
-          .disabled(vm.isCapturing || vm.isGeneratingPhoto || !vm.isBodyTrackingActive || vm.detectedSubjectCount == 0 || vm.selectedReferenceImage == nil || vm.isCalibratingHeight)
-          .opacity((vm.isCapturing || vm.isGeneratingPhoto || !vm.isBodyTrackingActive || vm.detectedSubjectCount == 0 || vm.selectedReferenceImage == nil || vm.isCalibratingHeight) ? 0.5 : 1.0)
-           
-          Button(action: {
-            if !vm.isBodyTrackingActive { vm.shareURL = ARMeshExporter.exportCurrentScene() }
-          }) {
-            Image(systemName: "square.and.arrow.up").font(.system(size: 20, weight: .semibold))
-              .padding(12).background(.ultraThinMaterial, in: Circle()).accessibilityLabel("Export Scene")
-          }
-          .disabled(vm.isBodyTrackingActive || !ARMeshExporter.hasMesh || vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight)
-          .opacity((vm.isBodyTrackingActive || !ARMeshExporter.hasMesh || vm.isCapturing || vm.isGeneratingPhoto || vm.isCalibratingHeight) ? 0.5 : 1.0)
           Spacer()
+          
+          // Analyze scene button
+          Button(action: { vm.analyzeScene() }) {
+            Image(systemName: "wand.and.stars").font(.system(size: 22, weight: .semibold))
+              .frame(width: 42, height: 42)
+              .background(.ultraThinMaterial, in: Circle())
+              .foregroundColor(.white)
+          }
+          .disabled(vm.isCapturing || vm.isGeneratingPhoto)
+          .opacity((vm.isCapturing || vm.isGeneratingPhoto) ? 0.5 : 1.0)
         }
-        .padding(.bottom, 10)
+        .padding(.horizontal, 30)
+        .padding(.bottom, 20)
       }
       .padding(.horizontal)
     }
@@ -578,9 +592,10 @@ struct ContentView: View {
         apiURL: "YOUR_ANALYSIS_ENDPOINT_URL_IF_ANY"
       )
       
-      struct EnvHelper { static func value(for key: String) -> String { return ProcessInfo.processInfo.environment[key] ?? "" } }
       let geminiAPIKey = EnvHelper.value(for: "GEMINI_API_KEY")
       let geminiBaseURLForFlashModel = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+      
+      print("Gemini API Key loaded: \(geminiAPIKey.isEmpty ? "NOT FOUND" : "Found (\(geminiAPIKey.prefix(8))...)")")
       
       APIService.shared.configureFlash(
         apiKey: geminiAPIKey,
@@ -675,21 +690,16 @@ struct ARViewContainer: UIViewRepresentable {
     private var currentBodyAnchor: ARBodyAnchor?
     private var cancellables: Set<AnyCancellable> = []
     private var boxAnchors: [UUID: AnchorEntity] = [:]
-    private let autoResetThreshold: Float = -0.35
-    private let autoResetThresholdUncalibratedFactor: Float = -0.15
+    
+    // Smoothing buffers for measurements
+    private var distanceBuffer: [Float] = []
+    private var heightBuffer: [Float] = []
+    private let bufferSize = 3 // Reduced for more responsive updates
      
     init(vm: ARViewModel, boxVM: BoxPlacementViewModel) {
       self.vm = vm
       self.boxVM = boxVM
       super.init()
-      vm.$calibrationResetTrigger
-        .sink { [weak self] _ in self?.resetCalibrationInternal() }
-        .store(in: &cancellables)
-      vm.$triggerFloorMeasurement
-        .sink { [weak self] triggered in
-          if triggered { self?.takeFloorMeasurementForCalibration() }
-        }
-        .store(in: &cancellables)
       boxVM.$boxes.sink { [weak self] boxes in self?.syncBoxes(boxes) }.store(in: &cancellables)
       print("Coordinator Initialized")
     }
@@ -715,19 +725,6 @@ struct ARViewContainer: UIViewRepresentable {
         }
     }
 
-    func takeFloorMeasurementForCalibration() {
-      guard let cameraY = arView?.session.currentFrame?.camera.transform.translation.y else {
-        DispatchQueue.main.async {
-          self.vm.calibrationInstruction = "Error: Could not get camera position. Try again."
-          self.vm.triggerFloorMeasurement = false
-        }
-        return
-      }
-      DispatchQueue.main.async {
-        self.vm.processTakenFloorMeasurement(cameraY: cameraY)
-        self.vm.triggerFloorMeasurement = false
-      }
-    }
       
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
       calculateGeneralCameraHeight(cameraTransform: frame.camera.transform, frame: frame)
@@ -766,6 +763,8 @@ struct ARViewContainer: UIViewRepresentable {
                 self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"
                 self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
             }
+            // Clear smoothing buffers when tracking is lost
+            distanceBuffer.removeAll()
         } else if !vm.isBodyTrackingActive {
             DispatchQueue.main.async {
                 self.vm.distanceToPerson = "Body tracking N/A"
@@ -776,13 +775,63 @@ struct ARViewContainer: UIViewRepresentable {
         return
       }
       let cameraTransform = frame.camera.transform
-      let bodyTransform = bodyAnchor.transform
-      let distance = simd_distance(cameraTransform.translation, bodyTransform.translation)
-      let distanceString = String(format: "%.1f m", distance)
+      let cameraPosition = cameraTransform.translation
+      
+      // Calculate distance using multiple body joints for better accuracy
+      var distances: [Float] = []
+      
+      // Try to get hip/root position (most stable)
+      if let hipTransform = bodyAnchor.skeleton.modelTransform(for: .root) {
+        let hipWorldPos = (bodyAnchor.transform * hipTransform).translation
+        distances.append(simd_distance(cameraPosition, hipWorldPos))
+      }
+      
+      // Also consider left and right shoulder for averaging (forms chest center)
+      if let leftShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .leftShoulder),
+         let rightShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .rightShoulder) {
+        let leftShoulderPos = (bodyAnchor.transform * leftShoulderTransform).translation
+        let rightShoulderPos = (bodyAnchor.transform * rightShoulderTransform).translation
+        // Calculate chest center as midpoint between shoulders
+        let chestCenter = SIMD3<Float>(
+          (leftShoulderPos.x + rightShoulderPos.x) / 2,
+          (leftShoulderPos.y + rightShoulderPos.y) / 2,
+          (leftShoulderPos.z + rightShoulderPos.z) / 2
+        )
+        distances.append(simd_distance(cameraPosition, chestCenter))
+      }
+      
+      // Fall back to body anchor transform if no joints available
+      if distances.isEmpty {
+        let bodyPosition = bodyAnchor.transform.translation
+        distances.append(simd_distance(cameraPosition, bodyPosition))
+      }
+      
+      // Average the distances for more stable measurement
+      let averageDistance = distances.reduce(0, +) / Float(distances.count)
+      
+      // Add to smoothing buffer
+      distanceBuffer.append(averageDistance)
+      if distanceBuffer.count > bufferSize {
+        distanceBuffer.removeFirst()
+      }
+      
+      // Calculate smoothed distance
+      let smoothedDistance = distanceBuffer.reduce(0, +) / Float(distanceBuffer.count)
+      
+      // Format distance with appropriate precision
+      let distanceString: String
+      if smoothedDistance < 1.0 {
+        distanceString = String(format: "%.2f m", smoothedDistance) // More precision for close distances
+      } else {
+        distanceString = String(format: "%.1f m", smoothedDistance)
+      }
+      
       calculateCameraHeightRelativeToEyes(bodyAnchor: bodyAnchor, cameraTransform: cameraTransform)
       determineVisibleBodyParts(bodyAnchor: bodyAnchor, frame: frame)
+      
       DispatchQueue.main.async {
-        if self.vm.distanceToPerson != distanceString { self.vm.distanceToPerson = distanceString }
+        // Always update for fresh values
+        self.vm.distanceToPerson = distanceString
       }
     }
 
@@ -837,95 +886,96 @@ struct ARViewContainer: UIViewRepresentable {
     }
 
     func calculateCameraHeightRelativeToEyes(bodyAnchor: ARBodyAnchor, cameraTransform: matrix_float4x4) {
+      // Try to get head joint first
       guard let headJointTransform = bodyAnchor.skeleton.modelTransform(for: .head) else {
+        // Fallback: try to estimate from shoulders
+        if let leftShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .leftShoulder),
+           let rightShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .rightShoulder) {
+          let leftShoulderPos = (bodyAnchor.transform * leftShoulderTransform).translation
+          let rightShoulderPos = (bodyAnchor.transform * rightShoulderTransform).translation
+          let shoulderCenter = SIMD3<Float>(
+            (leftShoulderPos.x + rightShoulderPos.x) / 2,
+            (leftShoulderPos.y + rightShoulderPos.y) / 2,
+            (leftShoulderPos.z + rightShoulderPos.z) / 2
+          )
+          let cameraWorldPosition = cameraTransform.translation
+          // Estimate eye position from shoulder center (typically ~25-30cm above shoulders)
+          let estimatedEyeWorldY = shoulderCenter.y + 0.28
+          let heightDifference = cameraWorldPosition.y - estimatedEyeWorldY
+          let directionText = heightDifference > 0.05 ? "Above" : (heightDifference < -0.05 ? "Below" : "Level with")
+          let text = String(format: "Eyes: Cam %.2fm %@ Subject", abs(heightDifference), directionText)
+          DispatchQueue.main.async {
+            // Always update for fresh values
+            self.vm.cameraHeightRelativeToEyes = text
+          }
+          return
+        }
         DispatchQueue.main.async { self.vm.cameraHeightRelativeToEyes = "Eyes: Head Joint N/A" }
         return
       }
-      let jointWorldTransform = bodyAnchor.transform * headJointTransform
-      let jointWorldPosition = jointWorldTransform.translation
+      
+      let headWorldTransform = bodyAnchor.transform * headJointTransform
+      let headWorldPosition = headWorldTransform.translation
       let cameraWorldPosition = cameraTransform.translation
-      let estimatedEyeYOffset: Float = -0.1 // Approximate offset from head joint center to eye level
-      let estimatedEyeWorldY = jointWorldPosition.y + estimatedEyeYOffset
+      
+      // More accurate eye offset estimation based on head joint
+      // Head joint is typically at the center of the head, eyes are ~5-8cm below and forward
+      let estimatedEyeYOffset: Float = -0.07 // Refined offset from head joint center to eye level
+      let estimatedEyeWorldY = headWorldPosition.y + estimatedEyeYOffset
+      
       let heightDifference = cameraWorldPosition.y - estimatedEyeWorldY
-      let directionText = heightDifference > 0.05 ? "Above" : (heightDifference < -0.05 ? "Below" : "Level with")
+      let directionText: String
+      if abs(heightDifference) < 0.05 {
+        directionText = "Level with"
+      } else if heightDifference > 0 {
+        directionText = "Above"
+      } else {
+        directionText = "Below"
+      }
+      
       let text = String(format: "Eyes: Cam %.2fm %@ Subject", abs(heightDifference), directionText)
       DispatchQueue.main.async {
-        if self.vm.cameraHeightRelativeToEyes != text { self.vm.cameraHeightRelativeToEyes = text }
+        // Always update for fresh values
+        self.vm.cameraHeightRelativeToEyes = text
       }
     }
 
     func calculateGeneralCameraHeight(cameraTransform: matrix_float4x4, frame: ARFrame) {
         let cameraWorldY = cameraTransform.translation.y
         var text: String
-        if !vm.isCalibratingHeight && !vm.automaticResetCooldownActive {
-            var triggerAutoReset = false
-            var reasonForReset = ""
-            if vm.isCalibrated, let calibFloorY = vm.calibratedFloorY {
-                let heightRelativeToCalibrated = cameraWorldY - calibFloorY
-                if heightRelativeToCalibrated < self.autoResetThreshold {
-                    triggerAutoReset = true
-                    reasonForReset = "Height (\(String(format: "%.2f", heightRelativeToCalibrated))m) sig. below calibrated floor."
-                }
-            } else { // Not calibrated, check against ARKit detected floor/table
-                let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
-                                    .filter { $0.alignment == .horizontal && ($0.classification == .floor || $0.classification == .table) }
-                if let floorPlane = floorPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) { // Use closest horizontal plane classified as floor/table
-                    let heightRelativeToDetectedFloor = cameraWorldY - floorPlane.transform.translation.y
-                    // More lenient threshold if not calibrated but floor detected
-                    if heightRelativeToDetectedFloor < (self.autoResetThreshold - 0.15) { // e.g. -0.5m
-                        triggerAutoReset = true
-                        reasonForReset = "Height (\(String(format: "%.2f", heightRelativeToDetectedFloor))m) sig. below ARKit floor/table."
-                    }
-                }
+        
+        // Simple approach - find the lowest horizontal plane (floor or table)
+        let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
+            .filter { $0.alignment == .horizontal && ($0.classification == .floor || $0.classification == .table) }
+        
+        if let floorPlane = floorPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
+            let height = cameraWorldY - floorPlane.transform.translation.y
+            if height < -0.1 {
+                text = String(format: "Cam Height: %.2fm (Low?)", height)
+            } else {
+                text = String(format: "Cam Height: %.2fm (\(floorPlane.classification == .floor ? "Floor" : "Table"))", height)
             }
-
-            if triggerAutoReset && !vm.isCalibratingHeight { // Only auto-reset if not currently calibrating
-                print("!!! AUTO CALIBRATION RESET: \(reasonForReset) !!!")
-                DispatchQueue.main.async { self.vm.resetCalibration(triggeredAutomatically: true) }
-                return // Early exit to prevent further height calculations this frame
+        } else {
+            // No classified floor/table, try any horizontal plane
+            let horizontalPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
+                .filter { $0.alignment == .horizontal }
+            
+            if let anyHorizontalPlane = horizontalPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
+                let height = cameraWorldY - anyHorizontalPlane.transform.translation.y
+                if height < -0.1 {
+                    text = String(format: "Cam Height: %.2fm (Plane - Low?)", height)
+                } else {
+                    text = String(format: "Cam Height: %.2fm (Plane)", height)
+                }
+            } else {
+                // No planes detected, height relative to origin
+                text = String(format: "Cam Height: %.2fm (Origin)", cameraWorldY)
             }
         }
         
-        // Proceed with height string generation
-        if vm.isCalibratingHeight { text = "Cam Height: Calibrating..." }
-        else if vm.isCalibrated, let calibratedFloorY = vm.calibratedFloorY {
-            let height = cameraWorldY - calibratedFloorY
-            if height < -0.01 && height >= autoResetThreshold { // Negative but not too low to trigger reset
-                text = String(format: "Cam Height: %.2fm (Below Calib. Floor)", height)
-            } else {
-                text = String(format: "Cam Height: %.2fm (Calibrated)", height)
-            }
-        } else { // Not calibrated
-            if vm.automaticResetCooldownActive { text = "Cam Height: N/A (Auto-Reset)" }
-            else {
-                let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal && ($0.classification == .floor || $0.classification == .table)}
-                if let floorPlane = floorPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
-                    let height = cameraWorldY - floorPlane.transform.translation.y
-                    if height < -0.1 && height >= (autoResetThreshold - 0.15) { // Negative but not too low
-                        text = String(format: "Cam Height: %.2fm (Floor/Table - Low?)", height)
-                    } else {
-                        text = String(format: "Cam Height: %.2fm (\(floorPlane.classification == .floor ? "Floor" : "Table"))", height)
-                    }
-                } else { // No classified floor/table, try any horizontal plane
-                    let horizontalPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }
-                    if let anyHorizontalPlane = horizontalPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
-                        let height = cameraWorldY - anyHorizontalPlane.transform.translation.y
-                         if height < -0.1 { // If below any detected horizontal plane by a bit
-                             text = String(format: "Cam Height: %.2fm (Plane - Low?)", height)
-                         } else {
-                             text = String(format: "Cam Height: %.2fm (Plane)", height)
-                         }
-                    } else { // No planes detected, height relative to origin
-                        text = String(format: "Cam Height: %.2fm (Origin)", cameraWorldY)
-                    }
-                }
-            }
-        }
         DispatchQueue.main.async {
-            // Only update if not in cooldown OR if text is different from auto-reset default
-            if !self.vm.automaticResetCooldownActive || text != "Cam Height: N/A (Auto-Reset)" {
-                if self.vm.generalCameraHeight != text { self.vm.generalCameraHeight = text }
-            }
+            // Always update to ensure fresh values
+            self.vm.generalCameraHeight = text
         }
     }
 
@@ -950,7 +1000,8 @@ struct ARViewContainer: UIViewRepresentable {
       }
       let text = !visibleJointsDescriptions.isEmpty ? "Visible: " + visibleJointsDescriptions.prefix(5).joined(separator: ", ") + (visibleJointsDescriptions.count > 5 ? "..." : "") : (vm.detectedSubjectCount > 0 ? "Visible Parts: Subject Occluded/Out of View" : "Visible Parts: N/A")
       DispatchQueue.main.async {
-        if self.vm.visibleBodyPartsInfo != text { self.vm.visibleBodyPartsInfo = text }
+        // Always update for fresh values
+        self.vm.visibleBodyPartsInfo = text
       }
     }
 
@@ -969,12 +1020,10 @@ struct ARViewContainer: UIViewRepresentable {
         DispatchQueue.main.async {
           self.vm.bodyTrackingHint = self.vm.isBodyTrackingActive ? "Body Tracking Active" : "World Tracking Active"
           self.vm.distanceToPerson = "Looking for subjects..."
-          self.vm.resetCalibration(triggeredAutomatically: false)
           self.fetchInitialCameraFOV() // Re-fetch FOV as session restarted
         }
       } else { DispatchQueue.main.async { self.vm.bodyTrackingHint = "Session resumed, but config lost." } }
     }
-    private func resetCalibrationInternal() { print("Coordinator: Observed calibration reset trigger.") }
     private func syncBoxes(_ boxes: [PlacedBox]) { /* ... (Existing box syncing logic can be added here) ... */ }
   }
 }
@@ -1067,6 +1116,37 @@ extension SIMD3 where Scalar == Float { static var zero: SIMD3<Float> { .init(0,
 struct APIResponse: Identifiable, Codable {
   let id: UUID; let timestamp: Date; let response: String
   init(response: String) { self.id = UUID(); self.timestamp = Date(); self.response = response }
+}
+
+// MARK: - 6 DOF Adjustment Models
+struct DOFAdjustment: Codable {
+    let translation: TranslationAdjustment
+    let rotation: RotationAdjustment
+}
+
+struct TranslationAdjustment: Codable {
+    let x: DirectionAdjustment  // Left/Right
+    let y: DirectionAdjustment  // Up/Down
+    let z: DirectionAdjustment  // Forward/Back
+}
+
+struct RotationAdjustment: Codable {
+    let yaw: DirectionAdjustment   // Pan Left/Right
+    let pitch: DirectionAdjustment // Tilt Up/Down
+    let roll: DirectionAdjustment  // Rotate CW/CCW
+}
+
+struct DirectionAdjustment: Codable {
+    let direction: String    // e.g., "left", "right", "up", "down", "forward", "back", "clockwise", "counter-clockwise", "no change"
+    let magnitude: Double?   // Value in meters for translation or degrees for rotation
+    let unit: String        // "m" for meters, "deg" for degrees
+    let description: String // Human-readable description
+}
+
+struct StructuredGeminiResponse: Codable {
+    let adjustments: DOFAdjustment
+    let summary: String?
+    let confidence: Double?
 }
 
 // MARK: - Potential File: Services/APIService.swift
@@ -1248,6 +1328,90 @@ class APIService {
         throw NSError(domain: "APIService.FlashGen", code: 106, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))"])
     }
   }
+  
+  func sendStructuredImageComparisonRequest(referenceImage: UIImage, currentImage: UIImage, prompt: String, additionalMetrics: [String: String]?) async throws -> (StructuredGeminiResponse, String) {
+    guard !flashApiURLString.isEmpty else {
+        throw NSError(domain: "APIService.FlashGen", code: 101, userInfo: [NSLocalizedDescriptionKey: "Flash 2.0 API URL not configured."])
+    }
+    guard let url = URL(string: flashApiURLString) else {
+        throw NSError(domain: "APIService.FlashGen", code: 103, userInfo: [NSLocalizedDescriptionKey: "Invalid Flash 2.0 API URL: \(flashApiURLString)"])
+    }
+    guard let refImageData = referenceImage.jpegData(compressionQuality: 0.85),
+          let currentImageData = currentImage.jpegData(compressionQuality: 0.8) else {
+        throw NSError(domain: "APIService.FlashGen", code: 102, userInfo: [NSLocalizedDescriptionKey: "Failed to convert images to JPEG."])
+    }
+    let base64RefImage = refImageData.base64EncodedString()
+    let base64CurrentImage = currentImageData.base64EncodedString()
+    
+    var partsArray: [[String: Any]] = [
+        ["text": prompt],
+        ["inline_data": ["mime_type": "image/jpeg", "data": base64RefImage]],
+        ["inline_data": ["mime_type": "image/jpeg", "data": base64CurrentImage]]
+    ]
+    
+    let requestPayload: [String: Any] = [
+        "contents": [["parts": partsArray]]
+    ]
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: requestPayload)
+    print("Sending structured multimodal request to Flash Gen API: \(url.absoluteString). Prompt length: \(prompt.count) chars. Ref Img: \(base64RefImage.count/1024)KB, Cur Img: \(base64CurrentImage.count/1024)KB")
+    
+    let (data, response) = try await URLSession.shared.data(for: request)
+    
+    guard let httpResponse = response as? HTTPURLResponse else {
+        throw NSError(domain: "APIService.FlashGen", code: 104, userInfo: [NSLocalizedDescriptionKey: "Invalid response object."])
+    }
+    print("Flash Gen API (Structured) Status Code: \(httpResponse.statusCode)")
+    
+    guard (200...299).contains(httpResponse.statusCode) else {
+        let errorDetail = String(data: data, encoding: .utf8) ?? "No details"
+        print("Flash API Error (\(httpResponse.statusCode)): \(errorDetail)")
+        throw NSError(domain: "APIService.FlashGen", code: 105, userInfo: [NSLocalizedDescriptionKey: "Flash API error. Status: \(httpResponse.statusCode). Details: \(errorDetail.prefix(500))"])
+    }
+    
+    do {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let firstCandidate = candidates.first,
+              let content = firstCandidate["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]] else {
+            throw NSError(domain: "APIService.FlashGen", code: 107, userInfo: [NSLocalizedDescriptionKey: "Response not valid JSON structure."])
+        }
+        
+        var jsonResponseText = ""
+        for part in parts {
+            if let text = part["text"] as? String {
+                jsonResponseText = text
+                break
+            }
+        }
+        
+        // Clean the response text (remove any markdown formatting if present)
+        let cleanedJSON = jsonResponseText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Parse the JSON response into our structured model
+        guard let jsonData = cleanedJSON.data(using: .utf8) else {
+            throw NSError(domain: "APIService.FlashGen", code: 108, userInfo: [NSLocalizedDescriptionKey: "Failed to convert response text to data."])
+        }
+        
+        let structuredResponse = try JSONDecoder().decode(StructuredGeminiResponse.self, from: jsonData)
+        
+        print("Successfully parsed structured response from Gemini")
+        return (structuredResponse, jsonResponseText)
+        
+    } catch let decodingError as DecodingError {
+        let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
+        print("Failed to decode structured response: \(decodingError). Raw: \(rawResponse.prefix(500))")
+        throw NSError(domain: "APIService.FlashGen", code: 109, userInfo: [NSLocalizedDescriptionKey: "Failed to decode structured response: \(decodingError.localizedDescription)"])
+    } catch {
+        throw error
+    }
+  }
 }
 
 // MARK: - Potential File: Views/ResponsesView.swift
@@ -1317,6 +1481,32 @@ struct SettingsView: View {
             .foregroundColor(.secondary)
         }
         
+        Section(header: Text("3D Export")) {
+          Button(action: {
+            if !viewModel.isBodyTrackingActive {
+              viewModel.shareURL = ARMeshExporter.exportCurrentScene()
+            }
+          }) {
+            HStack {
+              Image(systemName: "cube.box")
+                .foregroundColor(.accentColor)
+              Text("Export 3D Scene")
+                .foregroundColor(.primary)
+              Spacer()
+              if viewModel.isBodyTrackingActive || !ARMeshExporter.hasMesh {
+                Text("Unavailable")
+                  .font(.caption)
+                  .foregroundColor(.secondary)
+              }
+            }
+          }
+          .disabled(viewModel.isBodyTrackingActive || !ARMeshExporter.hasMesh)
+          
+          Text("Export the current AR scene as a USDZ file. Only available with LiDAR devices when body tracking is disabled.")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        
         Section(header: Text("About")) {
           HStack {
             Text("Version")
@@ -1341,7 +1531,35 @@ struct ReferenceImageMetadata: Codable, Equatable {
     var distanceFromCamera: String
     var distanceBelowEyeline: String
     var cameraHeight: String
-    static var empty: ReferenceImageMetadata { ReferenceImageMetadata(distanceFromCamera: "", distanceBelowEyeline: "", cameraHeight: "") }
+    // New comprehensive metrics
+    var cameraHeightRelativeToEyes: String
+    var visibleBodyParts: String
+    var detectedSubjectCount: String
+    var cameraRollDeg: String
+    var cameraPitchDeg: String
+    var cameraYawDeg: String
+    var cameraFOVHDeg: String
+    var ambientLux: String
+    var colorTempK: String
+    var captureDate: Date
+    
+    static var empty: ReferenceImageMetadata { 
+        ReferenceImageMetadata(
+            distanceFromCamera: "", 
+            distanceBelowEyeline: "", 
+            cameraHeight: "",
+            cameraHeightRelativeToEyes: "",
+            visibleBodyParts: "",
+            detectedSubjectCount: "",
+            cameraRollDeg: "",
+            cameraPitchDeg: "",
+            cameraYawDeg: "",
+            cameraFOVHDeg: "",
+            ambientLux: "",
+            colorTempK: "",
+            captureDate: Date()
+        ) 
+    }
 }
 
 struct ReferenceImage: Identifiable, Codable, Equatable {
@@ -1426,6 +1644,18 @@ class ReferenceImageViewModel: ObservableObject {
     init() {
         load()
         loadSelection()
+        
+        // Listen for capture notifications
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(refreshImages),
+            name: Notification.Name("RefreshReferenceImages"),
+            object: nil
+        )
+    }
+    
+    @objc private func refreshImages() {
+        load()
     }
     
     func load() {
@@ -1501,8 +1731,11 @@ struct ReferenceImageSelector: View {
                             }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Dist: \(ref.metadata.distanceFromCamera.isEmpty ? "N/A" : ref.metadata.distanceFromCamera)m").font(.caption2)
-                                Text("Eyeline: \(ref.metadata.distanceBelowEyeline.isEmpty ? "N/A" : ref.metadata.distanceBelowEyeline)m").font(.caption2)
-                                Text("Cam Height: \(ref.metadata.cameraHeight.isEmpty ? "N/A" : ref.metadata.cameraHeight)m").font(.caption2)
+                                Text("Height: \(ref.metadata.cameraHeight.isEmpty ? "N/A" : ref.metadata.cameraHeight)m").font(.caption2)
+                                Text("Subjects: \(ref.metadata.detectedSubjectCount.isEmpty ? "N/A" : ref.metadata.detectedSubjectCount)").font(.caption2)
+                                if !ref.metadata.cameraRollDeg.isEmpty && ref.metadata.cameraRollDeg != "N/A" {
+                                    Text("Angle: R:\(ref.metadata.cameraRollDeg)° P:\(ref.metadata.cameraPitchDeg)°").font(.caption2)
+                                }
                             }
                         }
                         Spacer()
@@ -1557,14 +1790,12 @@ struct ReferenceImageMetadataInputView: View {
         NavigationView {
             Form {
                 Section(header: Text("Reference Image Metadata (Optional)")) {
-                    TextField("Approx. subject distance from camera (m)", text: $distanceFromCamera)
+                    TextField("Subject distance from camera (m)", text: $distanceFromCamera)
                         .keyboardType(.decimalPad)
-                    TextField("Approx. camera below subject's eyeline (m)", text: $distanceBelowEyeline)
-                        .keyboardType(.decimalPad)
-                    TextField("Approx. camera height from floor (m)", text: $cameraHeight)
+                    TextField("Camera height from floor (m)", text: $cameraHeight)
                         .keyboardType(.decimalPad)
                 }
-                 Text("These values help the AI understand the reference photo's perspective. Provide estimates if exact values are unknown. You can leave them blank.")
+                 Text("Add any manual adjustments to the metadata if needed. Note: Photos captured with the camera button will have all metrics automatically recorded.")
                     .font(.caption)
                     .foregroundColor(.gray)
             }
@@ -1578,10 +1809,21 @@ struct ReferenceImageMetadataInputView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Save") {
+                        // Create metadata with manual values, leave other fields empty
                         let meta = ReferenceImageMetadata(
                             distanceFromCamera: distanceFromCamera,
                             distanceBelowEyeline: distanceBelowEyeline,
-                            cameraHeight: cameraHeight
+                            cameraHeight: cameraHeight,
+                            cameraHeightRelativeToEyes: "",
+                            visibleBodyParts: "",
+                            detectedSubjectCount: "",
+                            cameraRollDeg: "",
+                            cameraPitchDeg: "",
+                            cameraYawDeg: "",
+                            cameraFOVHDeg: "",
+                            ambientLux: "",
+                            colorTempK: "",
+                            captureDate: Date()
                         )
                         if let img = vm.pendingImage {
                             vm.add(image: img, metadata: meta)
