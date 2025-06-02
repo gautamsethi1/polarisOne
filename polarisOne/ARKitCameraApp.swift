@@ -112,6 +112,9 @@ final class ARViewModel: ObservableObject {
   @Published var currentSubjectBounds: SubjectBounds? = nil
   @Published var activeGuidanceBox: GuidanceBox? = nil
   @Published var isGuidanceActive: Bool = false
+  @Published var guidanceSubjectScreenBounds: CGRect = .zero  // 2D screen bounds for overlay
+  @Published var guidanceDirections: GuidanceDirections = GuidanceDirections()
+  @Published var guidanceAlignmentScore: Float = 0.0
   
   // Performance metrics
   @Published var performanceMetrics: [PerformanceMetric] = []
@@ -601,7 +604,8 @@ final class ARViewModel: ObservableObject {
     print("📐 Subject size: \(subjectBounds.size)")
     
     // Get current camera transform
-    let cameraTransform = arView.session.currentFrame?.camera.transform ?? matrix_identity_float4x4
+    guard let frame = arView.session.currentFrame else { return }
+    let cameraTransform = frame.camera.transform
     
     // Calculate optimal framing position based on subject and LLM guidance
     let (targetPosition, targetDistance) = GuidanceBoxService.shared.calculateOptimalFramingPosition(
@@ -610,10 +614,7 @@ final class ARViewModel: ObservableObject {
       cameraTransform: cameraTransform
     )
     
-    print("🎯 Target framing position: \(targetPosition)")
-    print("📏 Target distance: \(targetDistance)m")
-    
-    // Create guidance box that frames the subject optimally
+    // Create guidance box data (keeping for compatibility)
     let guidanceBox = GuidanceBoxService.shared.createGuidanceBox(
       targetPosition: targetPosition,
       targetDistance: targetDistance,
@@ -622,31 +623,121 @@ final class ARViewModel: ObservableObject {
       cameraTransform: cameraTransform
     )
     
-    print("📦 Guidance box created:")
-    print("   - Position: \(guidanceBox.targetPosition)")
-    print("   - Size: \(guidanceBox.size)")
-    print("   - Confidence: \(guidanceBox.confidence)")
-    
     // Update state
     activeGuidanceBox = guidanceBox
     isGuidanceActive = true
     
-    // Show in AR view
-    GuidanceBoxRenderer.shared.showGuidanceBox(guidanceBox, in: arView)
+    // Calculate 2D guidance directions from LLM recommendations
+    updateGuidanceDirections(from: guidance.adjustments)
     
-    bodyTrackingHint = "Align the green frame with your subject for optimal composition"
-    print("✅ Guidance box activated - shows ideal framing")
+    // Convert subject bounds to screen coordinates
+    if let screenBounds = convertToScreenBounds(worldBounds: subjectBounds, frame: frame) {
+      guidanceSubjectScreenBounds = screenBounds
+    }
+    
+    bodyTrackingHint = "Follow the arrows to align your shot"
+    print("✅ 2D Guidance activated")
+  }
+  
+  private func updateGuidanceDirections(from adjustments: DOFAdjustment) {
+    var directions = GuidanceDirections()
+    
+    // Translation adjustments
+    if let xMag = adjustments.translation.x.magnitude, xMag > 0 {
+      if adjustments.translation.x.direction == "left" {
+        directions.moveLeft = Float(xMag)
+      } else if adjustments.translation.x.direction == "right" {
+        directions.moveRight = Float(xMag)
+      }
+    }
+    
+    if let yMag = adjustments.translation.y.magnitude, yMag > 0 {
+      if adjustments.translation.y.direction == "up" {
+        directions.moveUp = Float(yMag)
+      } else if adjustments.translation.y.direction == "down" {
+        directions.moveDown = Float(yMag)
+      }
+    }
+    
+    if let zMag = adjustments.translation.z.magnitude, zMag > 0 {
+      if adjustments.translation.z.direction == "forward" {
+        directions.moveForward = Float(zMag)
+      } else if adjustments.translation.z.direction == "back" {
+        directions.moveBack = Float(zMag)
+      }
+    }
+    
+    // Rotation adjustments
+    if let yawMag = adjustments.rotation.yaw.magnitude, yawMag > 0 {
+      if adjustments.rotation.yaw.direction == "left" {
+        directions.turnLeft = Float(yawMag)
+      } else if adjustments.rotation.yaw.direction == "right" {
+        directions.turnRight = Float(yawMag)
+      }
+    }
+    
+    if let pitchMag = adjustments.rotation.pitch.magnitude, pitchMag > 0 {
+      if adjustments.rotation.pitch.direction == "up" {
+        directions.tiltUp = Float(pitchMag)
+      } else if adjustments.rotation.pitch.direction == "down" {
+        directions.tiltDown = Float(pitchMag)
+      }
+    }
+    
+    guidanceDirections = directions
+  }
+  
+  func convertToScreenBounds(worldBounds: SubjectBounds, frame: ARFrame) -> CGRect? {
+    guard let arView = ARMeshExporter.arView else { return nil }
+    
+    // Get screen dimensions
+    let screenSize = arView.bounds.size
+    
+    // Project 8 corners of the 3D bounding box to screen
+    let halfSize = worldBounds.size / 2
+    let corners = [
+      worldBounds.center + SIMD3<Float>(-halfSize.x, -halfSize.y, -halfSize.z),
+      worldBounds.center + SIMD3<Float>( halfSize.x, -halfSize.y, -halfSize.z),
+      worldBounds.center + SIMD3<Float>(-halfSize.x,  halfSize.y, -halfSize.z),
+      worldBounds.center + SIMD3<Float>( halfSize.x,  halfSize.y, -halfSize.z),
+      worldBounds.center + SIMD3<Float>(-halfSize.x, -halfSize.y,  halfSize.z),
+      worldBounds.center + SIMD3<Float>( halfSize.x, -halfSize.y,  halfSize.z),
+      worldBounds.center + SIMD3<Float>(-halfSize.x,  halfSize.y,  halfSize.z),
+      worldBounds.center + SIMD3<Float>( halfSize.x,  halfSize.y,  halfSize.z)
+    ]
+    
+    var minX: CGFloat = .infinity
+    var maxX: CGFloat = -.infinity
+    var minY: CGFloat = .infinity
+    var maxY: CGFloat = -.infinity
+    
+    for corner in corners {
+      let screenPoint = frame.camera.projectPoint(corner, 
+                                                  orientation: .portrait,
+                                                  viewportSize: screenSize)
+      minX = min(minX, CGFloat(screenPoint.x))
+      maxX = max(maxX, CGFloat(screenPoint.x))
+      minY = min(minY, CGFloat(screenPoint.y))
+      maxY = max(maxY, CGFloat(screenPoint.y))
+    }
+    
+    // Ensure valid bounds
+    if minX == .infinity || maxX == -.infinity || minY == .infinity || maxY == -.infinity {
+      return nil
+    }
+    
+    return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
   }
   
   // Toggle guidance on/off
   func toggleGuidance() {
-    guard let arView = ARMeshExporter.arView else { return }
-    
     if isGuidanceActive {
-      // Hide guidance
-      GuidanceBoxRenderer.shared.hideGuidanceBox(in: arView)
+      // Disable all guidance
       isGuidanceActive = false
       activeGuidanceBox = nil
+      guidanceSubjectScreenBounds = .zero
+      guidanceDirections = GuidanceDirections()
+      guidanceAlignmentScore = 0
       bodyTrackingHint = "Guidance disabled"
     } else {
       // Try to reactivate guidance if we have data
@@ -671,6 +762,10 @@ struct ContentView: View {
   var body: some View {
     ZStack(alignment: .topLeading) {
       ARViewContainer(viewModel: vm, boxVM: boxVM).ignoresSafeArea()
+      
+      // Add 2D guidance overlay
+      GuidanceOverlay(viewModel: vm)
+        .ignoresSafeArea()
 
       VStack(alignment: .leading, spacing: 6) { // Reduced spacing
         if let refContainer = vm.selectedReferenceImage, let img = refContainer.image {
@@ -1052,7 +1147,8 @@ struct ARViewContainer: UIViewRepresentable {
       
       // Calculate subject bounds from ARKit body tracking
       if let subjectBounds = SubjectDetectionService.shared.calculateARSubjectBounds(from: bodyAnchor) {
-        DispatchQueue.main.async {
+        let updateWorldTrackingDataAndGuidance: () -> Void = { [weak self] () -> Void in
+          guard let self = self else { return }
           self.vm.currentSubjectBounds = subjectBounds
           
           // Calculate subject-relative camera orientation
@@ -1063,16 +1159,43 @@ struct ARViewContainer: UIViewRepresentable {
             )
           }
           
-          // Update guidance box position to follow subject if active
+          // Update guidance for 2D overlay if active
           if self.vm.isGuidanceActive,
-             let arView = self.arView,
-             let cameraTransform = frame.camera.transform as simd_float4x4? {
-            // Update box position based on current subject movement
-            GuidanceBoxRenderer.shared.updateBoxPositionForSubject(subjectBounds: subjectBounds, in: arView)
-            // Update visual feedback based on alignment quality
-            GuidanceBoxRenderer.shared.updateGuidanceBoxAlignment(subjectBounds: subjectBounds, cameraTransform: cameraTransform, in: arView)
+             let _ = self.arView,
+             let currentFrame = self.currentARFrame {
+            // Update 2D screen bounds for subject
+            if let screenBounds = self.vm.convertToScreenBounds(worldBounds: subjectBounds, frame: currentFrame) {
+              self.vm.guidanceSubjectScreenBounds = screenBounds
+            }
+            
+            // Calculate alignment score
+            if let activeBox = self.vm.activeGuidanceBox {
+              let cameraPosition = SIMD3<Float>(currentFrame.camera.transform.columns.3.x,
+                                                currentFrame.camera.transform.columns.3.y,
+                                                currentFrame.camera.transform.columns.3.z)
+              
+              // Distance alignment
+              let currentDistance = simd_length(subjectBounds.center - cameraPosition)
+              let targetDistance = simd_length(activeBox.targetPosition - cameraPosition)
+              let distanceError = abs(currentDistance - targetDistance)
+              let distanceScore = 1.0 - min(distanceError / 2.0, 1.0)
+              
+              // Position alignment (how centered the subject is)
+              let screenCenter = CGPoint(x: self.vm.guidanceSubjectScreenBounds.midX,
+                                         y: self.vm.guidanceSubjectScreenBounds.midY)
+              let idealCenter = CGPoint(x: self.arView!.bounds.midX,
+                                        y: self.arView!.bounds.midY)
+              let centerDistance = sqrt(pow(screenCenter.x - idealCenter.x, 2) + pow(screenCenter.y - idealCenter.y, 2))
+              let maxDistance = sqrt(pow(self.arView!.bounds.width / 2, 2) + pow(self.arView!.bounds.height / 2, 2))
+              let centerScore = 1.0 - min(centerDistance / maxDistance, 1.0)
+              
+              self.vm.guidanceAlignmentScore = Float((distanceScore + Float(centerScore)) / 2.0)
+            }
           }
         }
+        
+        DispatchQueue.main.async(execute: updateWorldTrackingDataAndGuidance)
+
       }
       
       DispatchQueue.main.async {
@@ -1547,6 +1670,20 @@ struct GuidanceBox {
     func currentWorldPosition(subjectCenter: SIMD3<Float>) -> SIMD3<Float> {
         return subjectCenter + subjectRelativeOffset
     }
+}
+
+// 2D Guidance directions for overlay
+struct GuidanceDirections {
+    var moveLeft: Float = 0
+    var moveRight: Float = 0
+    var moveUp: Float = 0
+    var moveDown: Float = 0
+    var moveForward: Float = 0
+    var moveBack: Float = 0
+    var turnLeft: Float = 0
+    var turnRight: Float = 0
+    var tiltUp: Float = 0
+    var tiltDown: Float = 0
 }
 
 // MARK: - Subject Detection Service
@@ -2495,6 +2632,324 @@ class APIService {
         throw error
     }
   }
+}
+
+// MARK: - Guidance Overlay View
+struct GuidanceOverlay: View {
+    @ObservedObject var viewModel: ARViewModel
+    
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // Subject bounding box
+                if viewModel.isGuidanceActive && viewModel.guidanceSubjectScreenBounds != .zero {
+                    // Draw the subject highlight box with rounded corners
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(lineWidth: 4)
+                        .foregroundColor(colorForAlignment(viewModel.guidanceAlignmentScore))
+                        .frame(width: viewModel.guidanceSubjectScreenBounds.width,
+                               height: viewModel.guidanceSubjectScreenBounds.height)
+                        .position(x: viewModel.guidanceSubjectScreenBounds.midX,
+                                  y: viewModel.guidanceSubjectScreenBounds.midY)
+                        .shadow(color: .black.opacity(0.3), radius: 2)
+                    
+                    // Corner indicators for better visibility
+                    let corners = [
+                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.minX, y: viewModel.guidanceSubjectScreenBounds.minY),
+                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.maxX, y: viewModel.guidanceSubjectScreenBounds.minY),
+                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.maxX, y: viewModel.guidanceSubjectScreenBounds.maxY),
+                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.minX, y: viewModel.guidanceSubjectScreenBounds.maxY)
+                    ]
+                    
+                    ForEach(0..<4) { index in
+                        Circle()
+                            .fill(colorForAlignment(viewModel.guidanceAlignmentScore))
+                            .frame(width: 12, height: 12)
+                            .position(corners[index])
+                            .shadow(radius: 2)
+                    }
+                    
+                    // Directional indicators
+                    DirectionalArrows(directions: viewModel.guidanceDirections,
+                                      screenSize: geometry.size,
+                                      subjectBounds: viewModel.guidanceSubjectScreenBounds)
+                    
+                    // Ideal framing guide (semi-transparent)
+                    if let _ = viewModel.activeGuidanceBox {
+                        IdealFramingGuide(viewModel: viewModel, screenSize: geometry.size)
+                    }
+                }
+            }
+        }
+        .allowsHitTesting(false)  // Don't block touch events
+    }
+    
+    func colorForAlignment(_ score: Float) -> Color {
+        if score < 0.3 {
+            return .red
+        } else if score < 0.7 {
+            return .yellow
+        } else {
+            return .green
+        }
+    }
+}
+
+struct DirectionalArrows: View {
+    let directions: GuidanceDirections
+    let screenSize: CGSize
+    let subjectBounds: CGRect
+    
+    var body: some View {
+        ZStack {
+            // Left arrow
+            if directions.moveLeft > 0.1 {
+                ArrowIndicator(direction: "left", magnitude: directions.moveLeft)
+                    .position(x: 50, y: screenSize.height / 2)
+            }
+            
+            // Right arrow
+            if directions.moveRight > 0.1 {
+                ArrowIndicator(direction: "right", magnitude: directions.moveRight)
+                    .position(x: screenSize.width - 50, y: screenSize.height / 2)
+            }
+            
+            // Up arrow
+            if directions.moveUp > 0.1 {
+                ArrowIndicator(direction: "up", magnitude: directions.moveUp)
+                    .position(x: screenSize.width / 2, y: 50)
+            }
+            
+            // Down arrow
+            if directions.moveDown > 0.1 {
+                ArrowIndicator(direction: "down", magnitude: directions.moveDown)
+                    .position(x: screenSize.width / 2, y: screenSize.height - 100)
+            }
+            
+            // Forward/Back indicators positioned below subject
+            if directions.moveForward > 0.1 || directions.moveBack > 0.1 {
+                DistanceIndicator(forward: directions.moveForward, back: directions.moveBack)
+                    .position(x: screenSize.width / 2, 
+                              y: min(subjectBounds.maxY + 80, screenSize.height - 150))
+            }
+            
+            // Rotation indicators (turn left/right)
+            if directions.turnLeft > 0.1 || directions.turnRight > 0.1 {
+                HStack(spacing: 40) {
+                    if directions.turnLeft > 0.1 {
+                        RotationIndicator(direction: "left", magnitude: directions.turnLeft)
+                    }
+                    if directions.turnRight > 0.1 {
+                        RotationIndicator(direction: "right", magnitude: directions.turnRight)
+                    }
+                }
+                .position(x: screenSize.width / 2, y: screenSize.height - 300)
+            }
+        }
+    }
+}
+
+struct ArrowIndicator: View {
+    let direction: String
+    let magnitude: Float
+    
+    var arrowImage: String {
+        switch direction {
+        case "left": return "chevron.left"
+        case "right": return "chevron.right"
+        case "up": return "chevron.up"
+        case "down": return "chevron.down"
+        default: return "circle"
+        }
+    }
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .fill(Color.blue)
+                    .frame(width: 60, height: 60)
+                
+                Image(systemName: arrowImage)
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .shadow(radius: 4)
+            
+            Text(String(format: "%.1fm", magnitude))
+                .font(.caption)
+                .fontWeight(.bold)
+                .foregroundColor(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color.black.opacity(0.8)))
+                .shadow(radius: 2)
+        }
+    }
+}
+
+struct DistanceIndicator: View {
+    let forward: Float
+    let back: Float
+    
+    var body: some View {
+        HStack(spacing: 20) {
+            if back > 0.1 {
+                VStack(spacing: 4) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 50, height: 50)
+                        
+                        Image(systemName: "arrow.backward")
+                            .font(.system(size: 25, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    .shadow(radius: 4)
+                    
+                    Text(String(format: "%.1fm", back))
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(Color.black.opacity(0.8)))
+                        .shadow(radius: 2)
+                }
+            }
+            
+            if forward > 0.1 {
+                VStack(spacing: 4) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 50, height: 50)
+                        
+                        Image(systemName: "arrow.forward")
+                            .font(.system(size: 25, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    .shadow(radius: 4)
+                    
+                    Text(String(format: "%.1fm", forward))
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(Color.black.opacity(0.8)))
+                        .shadow(radius: 2)
+                }
+            }
+        }
+    }
+}
+
+struct RotationIndicator: View {
+    let direction: String
+    let magnitude: Float
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .fill(Color.purple)
+                    .frame(width: 50, height: 50)
+                
+                Image(systemName: direction == "left" ? "arrow.turn.up.left" : "arrow.turn.up.right")
+                    .font(.system(size: 25, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .shadow(radius: 4)
+            
+            Text(String(format: "%.0f°", magnitude))
+                .font(.caption)
+                .fontWeight(.bold)
+                .foregroundColor(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color.black.opacity(0.8)))
+                .shadow(radius: 2)
+        }
+    }
+}
+
+struct IdealFramingGuide: View {
+    @ObservedObject var viewModel: ARViewModel
+    let screenSize: CGSize
+    
+    var body: some View {
+        // Only show when alignment is poor
+        if viewModel.guidanceAlignmentScore < 0.8 {
+            ZStack {
+                // Target zone indicator
+                Text("Move subject here")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.green.opacity(0.8)))
+                    .position(x: screenSize.width / 2, y: screenSize.height / 2 - calculateIdealFrameSize().height / 2 - 30)
+                    .shadow(radius: 3)
+                
+                // Main frame with animated pulse
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(style: StrokeStyle(lineWidth: 3, dash: [15, 10]))
+                    .foregroundColor(.green.opacity(0.6))
+                    .frame(width: calculateIdealFrameSize().width,
+                           height: calculateIdealFrameSize().height)
+                    .position(x: screenSize.width / 2, y: screenSize.height / 2)
+                    .scaleEffect(1.0 + (sin(Date().timeIntervalSince1970 * 2) * 0.02))
+                
+                // Rule of thirds guides (subtle)
+                RuleOfThirdsGuides(frameSize: calculateIdealFrameSize())
+                    .position(x: screenSize.width / 2, y: screenSize.height / 2)
+                    .opacity(0.3)
+            }
+        }
+    }
+    
+    func calculateIdealFrameSize() -> CGSize {
+        // Calculate based on current subject bounds and ideal framing
+        if viewModel.guidanceSubjectScreenBounds != .zero {
+            // Use subject-based sizing with margin
+            let margin: CGFloat = 1.5  // 50% margin around subject
+            return CGSize(width: viewModel.guidanceSubjectScreenBounds.width * margin,
+                          height: viewModel.guidanceSubjectScreenBounds.height * margin)
+        } else {
+            // Fallback to screen-based sizing
+            let baseWidth = screenSize.width * 0.7
+            let baseHeight = baseWidth / (16.0 / 9.0)
+            return CGSize(width: baseWidth, height: min(baseHeight, screenSize.height * 0.6))
+        }
+    }
+}
+
+struct RuleOfThirdsGuides: View {
+    let frameSize: CGSize
+    
+    var body: some View {
+        ZStack {
+            // Vertical lines
+            ForEach([1, 2], id: \.self) { index in
+                Rectangle()
+                    .fill(Color.green.opacity(0.2))
+                    .frame(width: 1, height: frameSize.height)
+                    .position(x: frameSize.width * CGFloat(index) / 3.0,
+                              y: frameSize.height / 2)
+            }
+            
+            // Horizontal lines
+            ForEach([1, 2], id: \.self) { index in
+                Rectangle()
+                    .fill(Color.green.opacity(0.2))
+                    .frame(width: frameSize.width, height: 1)
+                    .position(x: frameSize.width / 2,
+                              y: frameSize.height * CGFloat(index) / 3.0)
+            }
+        }
+    }
 }
 
 // MARK: - Potential File: Views/ResponsesView.swift
