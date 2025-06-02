@@ -74,6 +74,10 @@ final class ARViewModel: ObservableObject {
   @Published var fieldOfViewHorizontalDeg: Float?
   @Published var ambientIntensityLux: Float?
   @Published var ambientColorTemperatureKelvin: Float?
+  
+  // Subject-relative camera angles
+  @Published var subjectRelativePitch: Float? // Angle from horizontal plane through subject
+  @Published var subjectRelativeYaw: Float?   // Angle from front-facing subject direction
 
   // Computed properties for display strings
   var cameraOrientationDegString: String {
@@ -96,6 +100,11 @@ final class ARViewModel: ObservableObject {
     return String(format: "Color K: %.0f", temp)
   }
   
+  var subjectRelativeOrientationString: String {
+    guard let pitch = subjectRelativePitch, let yaw = subjectRelativeYaw else { return "Subject Angles: N/A" }
+    return String(format: "P:%.0f° Y:%.0f°", pitch * 180 / .pi, yaw * 180 / .pi)
+  }
+  
   // Store the latest structured response for potential UI use
   @Published var latestStructuredGuidance: StructuredGeminiResponse? = nil
   
@@ -103,6 +112,54 @@ final class ARViewModel: ObservableObject {
   @Published var currentSubjectBounds: SubjectBounds? = nil
   @Published var activeGuidanceBox: GuidanceBox? = nil
   @Published var isGuidanceActive: Bool = false
+  
+  // Performance metrics
+  @Published var performanceMetrics: [PerformanceMetric] = []
+  
+  private let performanceMetricsKey = "ARViewModelPerformanceMetrics"
+  
+  init() {
+    loadPerformanceMetrics()
+  }
+  
+  func savePerformanceMetrics() {
+    if let encoded = try? JSONEncoder().encode(performanceMetrics) {
+      UserDefaults.standard.set(encoded, forKey: performanceMetricsKey)
+    }
+  }
+  
+  func loadPerformanceMetrics() {
+    if let data = UserDefaults.standard.data(forKey: performanceMetricsKey),
+       let metrics = try? JSONDecoder().decode([PerformanceMetric].self, from: data) {
+      performanceMetrics = metrics
+    }
+  }
+  
+  func clearPerformanceMetrics() {
+    performanceMetrics = []
+    UserDefaults.standard.removeObject(forKey: performanceMetricsKey)
+  }
+  
+  // Calculate camera orientation relative to subject
+  func calculateSubjectRelativeOrientation(cameraTransform: matrix_float4x4, subjectCenter: SIMD3<Float>) {
+    let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+    
+    // Vector from camera to subject
+    let toSubject = subjectCenter - cameraPosition
+    let horizontalDistance = sqrt(toSubject.x * toSubject.x + toSubject.z * toSubject.z)
+    
+    // Calculate pitch: angle from horizontal plane
+    // Positive pitch = camera looking down, negative = looking up
+    if horizontalDistance > 0.01 {
+      let pitchRad = atan2(-toSubject.y, horizontalDistance)
+      subjectRelativePitch = pitchRad
+    }
+    
+    // Calculate yaw: horizontal angle from camera to subject
+    // 0° = subject directly in front, positive = subject to the right
+    let yawRad = atan2(toSubject.x, -toSubject.z)
+    subjectRelativeYaw = yawRad
+  }
 
 
 
@@ -178,6 +235,8 @@ final class ARViewModel: ObservableObject {
       cameraRollDeg: cameraRoll != nil ? String(format: "%.1f", -cameraRoll! * 180 / .pi) : "N/A",
       cameraPitchDeg: cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A",
       cameraYawDeg: cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A",
+      subjectRelativePitchDeg: subjectRelativePitch != nil ? String(format: "%.1f", subjectRelativePitch! * 180 / .pi) : "N/A",
+      subjectRelativeYawDeg: subjectRelativeYaw != nil ? String(format: "%.1f", subjectRelativeYaw! * 180 / .pi) : "N/A",
       cameraFOVHDeg: fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A",
       ambientLux: ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A",
       colorTempK: ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A",
@@ -210,6 +269,10 @@ final class ARViewModel: ObservableObject {
     
     isCapturing = true
     
+    // Start performance tracking
+    let startTime = Date()
+    var currentMetric = PerformanceMetric(timestamp: startTime)
+    
     // Capture current AR view
     let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
     let currentImage = renderer.image { ctx in
@@ -236,6 +299,11 @@ final class ARViewModel: ObservableObject {
     let yawDeg = cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A"
     let orientationPrompt = "R:\(rollDeg)°, P:\(pitchDeg)°, Y:\(yawDeg)°"
     
+    // Subject-relative angles
+    let subjectPitchDeg = subjectRelativePitch != nil ? String(format: "%.1f", subjectRelativePitch! * 180 / .pi) : "N/A"
+    let subjectYawDeg = subjectRelativeYaw != nil ? String(format: "%.1f", subjectRelativeYaw! * 180 / .pi) : "N/A"
+    let subjectOrientationPrompt = "P:\(subjectPitchDeg)°, Y:\(subjectYawDeg)°"
+    
     var currentMetrics: [String: String] = [
         "distance_to_person_meters": distanceStringValue,
         "camera_height_meters": finalCameraHeightForPrompt,
@@ -246,6 +314,8 @@ final class ARViewModel: ObservableObject {
         "camera_roll_deg": rollDeg,
         "camera_pitch_deg": pitchDeg,
         "camera_yaw_deg": yawDeg,
+        "subject_relative_pitch_deg": subjectPitchDeg,
+        "subject_relative_yaw_deg": subjectYawDeg,
         "camera_fov_h_deg": fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A",
         "ambient_lux": ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A",
         "color_temp_k": ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A"
@@ -268,6 +338,7 @@ final class ARViewModel: ObservableObject {
       - Visible body parts: \(refMeta.visibleBodyParts.isEmpty ? "N/A" : refMeta.visibleBodyParts)
       - Detected subject count: \(refMeta.detectedSubjectCount.isEmpty ? "N/A" : refMeta.detectedSubjectCount)
       - Camera Orientation (Roll, Pitch, Yaw): R:\(refMeta.cameraRollDeg)°, P:\(refMeta.cameraPitchDeg)°, Y:\(refMeta.cameraYawDeg)°
+      - Subject-Relative Camera Angles (Pitch, Yaw): P:\(refMeta.subjectRelativePitchDeg)°, Y:\(refMeta.subjectRelativeYawDeg)°
       - Camera Horizontal FOV: \(refMeta.cameraFOVHDeg.isEmpty ? "N/A" : "\(refMeta.cameraFOVHDeg)°")
       - Ambient Light: \(refMeta.ambientLux.isEmpty ? "N/A" : "\(refMeta.ambientLux) lux")
       - Color Temperature: \(refMeta.colorTempK.isEmpty ? "N/A" : "\(refMeta.colorTempK)K")
@@ -280,17 +351,18 @@ final class ARViewModel: ObservableObject {
       - Visible body parts: \(visibleBodyPartsInfo)
       - Detected subject count: \(detectedSubjectCount)
       - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
+      - Subject-Relative Camera Angles (Pitch, Yaw): \(subjectOrientationPrompt)
       - Camera Horizontal FOV: \(self.fieldOfViewDegString)
       - Ambient Light: \(self.ambientLuxString)
       - Color Temperature: \(self.colorTempKString)
       """
       
       prompt = """
-      You are an expert photography assistant. Your goal is to help me adjust my iPhone camera position and angle to make the live camera view (Photo 2) look as close as possible to a reference image (Photo 1).
+      You are an expert photography assistant specializing in portrait composition and framing. Your goal is to help adjust the camera to achieve the same composition, framing, and perspective as a reference photo.
 
       I will provide two images:
-      1. Photo 1: The reference image I want to emulate. (This will be the first image in the payload)
-      2. Photo 2: The current live view from my iPhone camera. (This will be the second image in the payload)
+      1. Photo 1: The reference image showing the desired composition
+      2. Photo 2: The current live camera view that needs adjustment
 
       Reference Photo Details (Photo 1):
       \(photo1Details)
@@ -298,7 +370,14 @@ final class ARViewModel: ObservableObject {
       Current Scene Details (Photo 2):
       \(photo2Details)
 
-      Based on these two images and their details, provide precise directives to adjust my iPhone (Photo 2) to better match Photo 1's perspective, angle, and subject framing.
+      Analyze the composition differences between the photos, focusing on:
+      - Subject positioning within the frame (rule of thirds, golden ratio)
+      - Amount of space around the subject (headroom, lead room)
+      - Subject size relative to frame
+      - Camera angle and perspective
+      - Overall framing and composition balance
+
+      Provide camera movement instructions to match Photo 1's composition.
       
       IMPORTANT: Respond ONLY with valid JSON in the following exact format:
       
@@ -309,19 +388,19 @@ final class ARViewModel: ObservableObject {
               "direction": "left|right|no change",
               "magnitude": 0.5,
               "unit": "m",
-              "description": "Move 0.5m left"
+              "description": "Move 0.5m left to center subject"
             },
             "y": {
               "direction": "up|down|no change",
               "magnitude": 0.2,
               "unit": "m",
-              "description": "Move 0.2m up"
+              "description": "Move 0.2m up for better eye level"
             },
             "z": {
               "direction": "forward|back|no change",
               "magnitude": 1.0,
               "unit": "m",
-              "description": "Move 1.0m forward"
+              "description": "Move 1.0m forward to match subject size"
             }
           },
           "rotation": {
@@ -329,32 +408,39 @@ final class ARViewModel: ObservableObject {
               "direction": "left|right|no change",
               "magnitude": 15,
               "unit": "deg",
-              "description": "Turn 15° left"
+              "description": "Turn 15° left to match angle"
             },
             "pitch": {
               "direction": "up|down|no change",
               "magnitude": 5,
               "unit": "deg",
-              "description": "Tilt 5° up"
+              "description": "Tilt 5° up for proper framing"
             },
             "roll": {
               "direction": "clockwise|counter-clockwise|no change",
               "magnitude": 0,
               "unit": "deg",
-              "description": "No roll adjustment needed"
+              "description": "Level the camera"
             }
+          },
+          "framing": {
+            "subject_position": "center|left_third|right_third|top_third|bottom_third",
+            "composition_rule": "rule_of_thirds|golden_ratio|centered|dynamic_symmetry",
+            "framing_type": "close_up|medium_shot|full_body|environmental",
+            "ideal_subject_percentage": 0.3
           }
         },
-        "summary": "Brief summary of key adjustments",
+        "summary": "Key adjustments for matching composition",
         "confidence": 0.85
       }
       
-      Rules:
-      - For "no change" directions, set magnitude to 0 or null
-      - Use precise numeric values
-      - Keep descriptions concise
-      - Confidence is a value between 0 and 1
-      - Respond with ONLY the JSON, no additional text
+      Guidelines:
+      - Focus on composition and framing, not just position
+      - Consider how the subject fills the frame
+      - Account for compositional balance and visual weight
+      - Magnitude values should be realistic (0.1-3.0m for translation, 1-45° for rotation)
+      - Confidence reflects how well you can determine the needed adjustments
+      - ideal_subject_percentage is how much of the frame the subject should occupy (0.0-1.0)
       """
     } else {
       // No reference image - just analyze the current scene
@@ -374,6 +460,7 @@ final class ARViewModel: ObservableObject {
       - Visible body parts: \(visibleBodyPartsInfo)
       - Detected subject count: \(detectedSubjectCount)
       - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
+      - Subject-Relative Camera Angles (Pitch, Yaw): \(subjectOrientationPrompt)
       - Camera Horizontal FOV: \(self.fieldOfViewDegString)
       - Ambient Light: \(self.ambientLuxString)
       - Color Temperature: \(self.colorTempKString)
@@ -382,6 +469,10 @@ final class ARViewModel: ObservableObject {
     
     Task {
       do {
+        // Track time to API call
+        let apiCallStartTime = Date()
+        currentMetric.buttonPressToAPICall = apiCallStartTime.timeIntervalSince(startTime)
+        
         if hasReference {
           // Use structured response for reference image comparison
           let (structuredResponse, rawJSON) = try await APIService.shared.sendStructuredImageComparisonRequest(
@@ -390,6 +481,10 @@ final class ARViewModel: ObservableObject {
             prompt: prompt,
             additionalMetrics: currentMetrics
           )
+          
+          // Track API response time
+          let apiResponseTime = Date()
+          currentMetric.apiResponseTime = apiResponseTime.timeIntervalSince(apiCallStartTime)
           
           // Format the structured response into human-readable text
           var formattedResponse = "Photo Guidance (6 DOF Adjustments):\n\n"
@@ -428,10 +523,24 @@ final class ARViewModel: ObservableObject {
             // Trigger guidance box creation if we have subject bounds
             if let subjectBounds = self.currentSubjectBounds {
               print("✅ Subject bounds available, creating guidance box")
+              let boxStartTime = Date()
               self.activateGuidanceBox(for: structuredResponse, subjectBounds: subjectBounds)
+              
+              // Track box placement time
+              currentMetric.boxPlacementTime = Date().timeIntervalSince(boxStartTime)
+              currentMetric.totalTime = Date().timeIntervalSince(startTime)
+              
+              // Save metric
+              self.performanceMetrics.append(currentMetric)
+              self.savePerformanceMetrics()
             } else {
               print("❌ No subject bounds available - cannot create guidance box")
               print("💡 Ensure a human subject is detected before analyzing scene")
+              
+              // Save metric even without box placement
+              currentMetric.totalTime = Date().timeIntervalSince(startTime)
+              self.performanceMetrics.append(currentMetric)
+              self.savePerformanceMetrics()
             }
             
             // Show brief hint with key adjustment
@@ -450,6 +559,9 @@ final class ARViewModel: ObservableObject {
             additionalMetrics: currentMetrics
           )
           
+          // Track API response time
+          currentMetric.apiResponseTime = Date().timeIntervalSince(apiCallStartTime)
+          
           let apiResponse = APIResponse(response: "Scene Analysis:\n\(responseText)")
           
           await MainActor.run {
@@ -457,6 +569,11 @@ final class ARViewModel: ObservableObject {
             viewModel.saveResponse(apiResponse)
             isCapturing = false
             showResponses = true
+            
+            // Save metric for non-reference analysis
+            currentMetric.totalTime = Date().timeIntervalSince(startTime)
+            self.performanceMetrics.append(currentMetric)
+            self.savePerformanceMetrics()
             
             // Show brief hint
             let previewText = responseText.prefix(60)
@@ -481,27 +598,34 @@ final class ARViewModel: ObservableObject {
     }
     
     print("✅ activateGuidanceBox called with subject at: \(subjectBounds.center)")
+    print("📐 Subject size: \(subjectBounds.size)")
     
-    // Calculate subject-relative offset based on LLM recommendations
+    // Get current camera transform
     let cameraTransform = arView.session.currentFrame?.camera.transform ?? matrix_identity_float4x4
     
-    let relativeOffset = GuidanceBoxService.shared.calculateSubjectRelativeOffset(
+    // Calculate optimal framing position based on subject and LLM guidance
+    let (targetPosition, targetDistance) = GuidanceBoxService.shared.calculateOptimalFramingPosition(
       currentSubjectBounds: subjectBounds,
       recommendations: guidance.adjustments,
       cameraTransform: cameraTransform
     )
     
-    print("📍 Subject-relative offset calculated: \(relativeOffset)")
-    print("📏 Offset magnitude: \(simd_length(relativeOffset))m")
+    print("🎯 Target framing position: \(targetPosition)")
+    print("📏 Target distance: \(targetDistance)m")
     
-    // Create guidance box with subject-relative positioning
+    // Create guidance box that frames the subject optimally
     let guidanceBox = GuidanceBoxService.shared.createGuidanceBox(
-      relativeOffset: relativeOffset,
+      targetPosition: targetPosition,
+      targetDistance: targetDistance,
       subjectBounds: subjectBounds,
-      recommendations: guidance.adjustments
+      recommendations: guidance.adjustments,
+      cameraTransform: cameraTransform
     )
     
-    print("📦 Guidance box created with size: \(guidanceBox.size)")
+    print("📦 Guidance box created:")
+    print("   - Position: \(guidanceBox.targetPosition)")
+    print("   - Size: \(guidanceBox.size)")
+    print("   - Confidence: \(guidanceBox.confidence)")
     
     // Update state
     activeGuidanceBox = guidanceBox
@@ -510,8 +634,8 @@ final class ARViewModel: ObservableObject {
     // Show in AR view
     GuidanceBoxRenderer.shared.showGuidanceBox(guidanceBox, in: arView)
     
-    bodyTrackingHint = "Guidance active: Green box follows subject position"
-    print("✅ Guidance box should now be visible")
+    bodyTrackingHint = "Align the green frame with your subject for optimal composition"
+    print("✅ Guidance box activated - shows ideal framing")
   }
   
   // Toggle guidance on/off
@@ -592,6 +716,7 @@ struct ContentView: View {
           
           // --- New Info Displays ---
           Text(vm.cameraOrientationDegString).infoStyle(fontSize: .caption2)
+          Text(vm.subjectRelativeOrientationString).infoStyle(fontSize: .caption2)
           Text(vm.fieldOfViewDegString).infoStyle(fontSize: .caption2)
           Text(vm.ambientLuxString).infoStyle(fontSize: .caption2)
           Text(vm.colorTempKString).infoStyle(fontSize: .caption2)
@@ -776,6 +901,7 @@ struct ARViewContainer: UIViewRepresentable {
     private var boxVM: BoxPlacementViewModel
     weak var arView: ARView?
     private var currentBodyAnchor: ARBodyAnchor?
+    private var currentARFrame: ARFrame?
     private var cancellables: Set<AnyCancellable> = []
     private var boxAnchors: [UUID: AnchorEntity] = [:]
     
@@ -818,6 +944,7 @@ struct ARViewContainer: UIViewRepresentable {
 
       
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+      currentARFrame = frame
       calculateGeneralCameraHeight(cameraTransform: frame.camera.transform, frame: frame)
       
       // Update camera orientation (eulerAngles are in radians: pitch, yaw, roll)
@@ -928,11 +1055,22 @@ struct ARViewContainer: UIViewRepresentable {
         DispatchQueue.main.async {
           self.vm.currentSubjectBounds = subjectBounds
           
+          // Calculate subject-relative camera orientation
+          if let frame = self.currentARFrame {
+            self.vm.calculateSubjectRelativeOrientation(
+              cameraTransform: frame.camera.transform,
+              subjectCenter: subjectBounds.center
+            )
+          }
+          
           // Update guidance box position to follow subject if active
           if self.vm.isGuidanceActive,
-             let arView = self.arView {
-            // Update box position based on current subject movement using the new subject-anchored system
+             let arView = self.arView,
+             let cameraTransform = frame.camera.transform as simd_float4x4? {
+            // Update box position based on current subject movement
             GuidanceBoxRenderer.shared.updateBoxPositionForSubject(subjectBounds: subjectBounds, in: arView)
+            // Update visual feedback based on alignment quality
+            GuidanceBoxRenderer.shared.updateGuidanceBoxAlignment(subjectBounds: subjectBounds, cameraTransform: cameraTransform, in: arView)
           }
         }
       }
@@ -1347,6 +1485,7 @@ struct APIResponse: Identifiable, Codable {
 struct DOFAdjustment: Codable {
     let translation: TranslationAdjustment
     let rotation: RotationAdjustment
+    let framing: FramingGuidance?
 }
 
 struct TranslationAdjustment: Codable {
@@ -1372,6 +1511,13 @@ struct StructuredGeminiResponse: Codable {
     let adjustments: DOFAdjustment
     let summary: String?
     let confidence: Double?
+}
+
+struct FramingGuidance: Codable {
+    let subject_position: String?  // "center", "left_third", "right_third", etc.
+    let composition_rule: String?  // "rule_of_thirds", "golden_ratio", etc.
+    let framing_type: String?      // "close_up", "medium_shot", "full_body", etc.
+    let ideal_subject_percentage: Double?  // 0.0-1.0 how much of frame subject should fill
 }
 
 // MARK: - Subject Detection & Guidance Models
@@ -1606,74 +1752,123 @@ class GuidanceBoxService {
     
     private init() {}
     
-    // Calculate subject-relative offset instead of absolute world position
-    func calculateSubjectRelativeOffset(
+    // Calculate optimal framing box position based on subject and LLM recommendations
+    func calculateOptimalFramingPosition(
         currentSubjectBounds: SubjectBounds,
         recommendations: DOFAdjustment,
         cameraTransform: simd_float4x4
-    ) -> SIMD3<Float> {
+    ) -> (position: SIMD3<Float>, distance: Float) {
         
-        // Use subject-relative vectors for positioning
-        // This ensures the box follows the subject as they move
-        let subjectRight = SIMD3<Float>(1.0, 0.0, 0.0)    // X-axis: left/right
-        let subjectUp = SIMD3<Float>(0.0, 1.0, 0.0)       // Y-axis: up/down
-        let subjectForward = SIMD3<Float>(0.0, 0.0, -1.0) // Z-axis: forward/back
+        // Get camera vectors and position
+        let cameraRight = SIMD3<Float>(cameraTransform.columns.0.x, cameraTransform.columns.0.y, cameraTransform.columns.0.z)
+        let cameraUp = SIMD3<Float>(cameraTransform.columns.1.x, cameraTransform.columns.1.y, cameraTransform.columns.1.z)
+        let cameraForward = -SIMD3<Float>(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+        let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
         
-        // Start with zero offset (box centered on subject)
-        var relativeOffset = SIMD3<Float>(0, 0, 0)
+        // Start with subject position as the center of our framing
+        var targetPosition = currentSubjectBounds.center
         
-        // Apply translation adjustments as offsets from subject center
+        // Calculate current distance from camera to subject
+        let currentDistance = simd_length(currentSubjectBounds.center - cameraPosition)
+        
+        // Apply LLM recommendations to find ideal camera position
+        // Then place box at subject position as seen from that ideal viewpoint
         let translation = recommendations.translation
         
-        // X-axis (left/right)
+        // Calculate where the camera should ideally be
+        var idealCameraOffset = SIMD3<Float>(0, 0, 0)
+        
+        // X-axis (left/right camera movement)
         if let xMagnitude = translation.x.magnitude, xMagnitude > 0 {
             let direction: Float = translation.x.direction == "right" ? 1.0 : -1.0
-            relativeOffset += subjectRight * Float(xMagnitude) * direction
+            idealCameraOffset += cameraRight * Float(xMagnitude) * direction
         }
         
-        // Y-axis (up/down)
+        // Y-axis (up/down camera movement)
         if let yMagnitude = translation.y.magnitude, yMagnitude > 0 {
             let direction: Float = translation.y.direction == "up" ? 1.0 : -1.0
-            relativeOffset += subjectUp * Float(yMagnitude) * direction
+            idealCameraOffset += cameraUp * Float(yMagnitude) * direction
         }
         
-        // Z-axis (forward/back)
+        // Z-axis (forward/back camera movement)
+        var targetDistance = currentDistance
         if let zMagnitude = translation.z.magnitude, zMagnitude > 0 {
-            let direction: Float = translation.z.direction == "forward" ? 1.0 : -1.0
-            relativeOffset += subjectForward * Float(zMagnitude) * direction
+            if translation.z.direction == "forward" {
+                targetDistance -= Float(zMagnitude)
+            } else if translation.z.direction == "back" {
+                targetDistance += Float(zMagnitude)
+            }
         }
         
-        return relativeOffset
+        // Adjust the framing box position to show where the subject should appear
+        // in the frame when camera is at the ideal position
+        // This creates a "window" showing the target composition
+        targetPosition -= idealCameraOffset * 0.5  // Partial offset to guide without obscuring
+        
+        return (targetPosition, targetDistance)
     }
     
-    // Create guidance box with adaptive sizing and subject-relative offset
+    // Create guidance box that frames the subject optimally
     func createGuidanceBox(
-        relativeOffset: SIMD3<Float>,
+        targetPosition: SIMD3<Float>,
+        targetDistance: Float,
         subjectBounds: SubjectBounds,
-        recommendations: DOFAdjustment
+        recommendations: DOFAdjustment,
+        cameraTransform: simd_float4x4
     ) -> GuidanceBox {
         
-        // Use subject bounds size with generous expansion to ensure it fits the subject
-        let expansionFactor: Float = 1.3 // 30% larger to ensure subject fits comfortably
-        let guidanceSize = subjectBounds.size * expansionFactor
+        // Calculate framing size based on subject and framing guidance
+        let aspectRatio: Float = 16.0 / 9.0
+        let subjectHeight = subjectBounds.size.y
         
-        // Ensure minimum realistic human dimensions for visibility
-        let minWidth: Float = 0.6   // 60cm minimum width
-        let minHeight: Float = 1.5  // 150cm minimum height  
-        let minDepth: Float = 0.5   // 50cm minimum depth
+        // Determine frame size based on framing type and ideal subject percentage
+        var marginFactor: Float = 1.4  // Default 40% margin
+        
+        // Use framing guidance if available
+        if let framing = recommendations.framing {
+            // Adjust margin based on framing type
+            switch framing.framing_type {
+            case "close_up":
+                marginFactor = 1.2  // 20% margin for close-ups
+            case "medium_shot":
+                marginFactor = 1.5  // 50% margin for medium shots
+            case "full_body":
+                marginFactor = 1.8  // 80% margin for full body
+            case "environmental":
+                marginFactor = 2.5  // 150% margin for environmental shots
+            default:
+                marginFactor = 1.4
+            }
+            
+            // Use ideal_subject_percentage if provided
+            if let idealPercentage = framing.ideal_subject_percentage, idealPercentage > 0 {
+                // Calculate frame size so subject fills the ideal percentage
+                marginFactor = 1.0 / Float(idealPercentage)
+            }
+        }
+        
+        // Calculate frame dimensions
+        let frameHeight = subjectHeight * marginFactor
+        let frameWidth = frameHeight * aspectRatio
+        
+        // Apply distance-based scaling for perspective
+        let distanceFactor = targetDistance / 3.0  // Normalize to 3m reference
+        let scaledHeight = frameHeight * min(max(distanceFactor, 0.5), 2.0)
+        let scaledWidth = frameWidth * min(max(distanceFactor, 0.5), 2.0)
         
         let finalSize = SIMD3<Float>(
-            max(guidanceSize.x, minWidth),
-            max(guidanceSize.y, minHeight),
-            max(guidanceSize.z, minDepth)
+            scaledWidth,
+            scaledHeight,
+            0.05  // Thin frame depth
         )
         
-        // Calculate initial target position for compatibility
-        let initialTargetPosition = subjectBounds.center + relativeOffset
+        // Calculate relative offset from camera to box
+        let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+        let relativeOffset = targetPosition - cameraPosition
         
         return GuidanceBox(
             id: UUID(),
-            targetPosition: initialTargetPosition,
+            targetPosition: targetPosition,
             subjectRelativeOffset: relativeOffset,
             size: finalSize,
             confidence: subjectBounds.confidence,
@@ -1690,38 +1885,133 @@ class GuidanceBoxRenderer {
     private var guidanceAnchor: AnchorEntity?
     private var boxEntity: ModelEntity?
     private var currentGuidanceBox: GuidanceBox?
+    private var lastAlignmentQuality: Float = 0.0
     
     private init() {}
     
-    func createGuidanceBoxEntity(guidanceBox: GuidanceBox) -> ModelEntity {
-        // Create wireframe box mesh
+    func createGuidanceBoxEntity(guidanceBox: GuidanceBox, alignmentQuality: Float = 0.0) -> ModelEntity {
+        // Create 2D rectangular frame with composition guides
         let size = guidanceBox.size
         
-        // Create box mesh with wireframe material
-        let boxMesh = MeshResource.generateBox(
-            width: size.x,
-            height: size.y,
-            depth: size.z
-        )
+        // Create empty parent entity
+        let frameEntity = ModelEntity()
         
-        // Create semi-transparent green material for better visibility
-        var transparentMaterial = UnlitMaterial(color: UIColor(red: 0, green: 1, blue: 0, alpha: 0.2))
-        transparentMaterial.blending = .transparent(opacity: 0.2)
-        
-        // Create main box with semi-transparent material
-        let boxEntity = ModelEntity(mesh: boxMesh, materials: [transparentMaterial])
-        
-        // Create wireframe edges manually for better visibility (also semi-transparent)
-        let wireframeThickness: Float = 0.03 // Increased thickness for better visibility
-        let edgeColor = UIColor(red: 0, green: 1, blue: 0, alpha: 0.8) // Semi-transparent bright green
-        
-        // Create 12 edge lines for the box wireframe
-        let edges = createWireframeEdges(size: size, thickness: wireframeThickness, color: edgeColor)
-        for edge in edges {
-            boxEntity.addChild(edge)
+        // Calculate color based on alignment quality (red -> yellow -> green)
+        let edgeColor: UIColor
+        if alignmentQuality < 0.3 {
+            // Poor alignment - red
+            edgeColor = UIColor(red: 1, green: 0, blue: 0, alpha: 1.0)
+        } else if alignmentQuality < 0.7 {
+            // Medium alignment - yellow
+            let greenAmount = (alignmentQuality - 0.3) / 0.4
+            edgeColor = UIColor(red: 1, green: CGFloat(greenAmount), blue: 0, alpha: 1.0)
+        } else {
+            // Good alignment - green
+            let redAmount = 1.0 - (alignmentQuality - 0.7) / 0.3
+            edgeColor = UIColor(red: CGFloat(redAmount), green: 1, blue: 0, alpha: 1.0)
         }
         
-        return boxEntity
+        // Main frame edges
+        let wireframeThickness: Float = 0.08
+        
+        // Create main frame edges
+        let edges = create2DFrameEdges(size: size, thickness: wireframeThickness, color: edgeColor)
+        for edge in edges {
+            frameEntity.addChild(edge)
+        }
+        
+        // Add rule of thirds guidelines (thinner and semi-transparent)
+        let guideThickness: Float = 0.02
+        let guideAlpha = 0.3 + (alignmentQuality * 0.3)  // More visible when better aligned
+        let guideColor = UIColor(red: 0, green: 1, blue: 0, alpha: CGFloat(guideAlpha))
+        let thirds = createRuleOfThirdsGuides(size: size, thickness: guideThickness, color: guideColor)
+        for guide in thirds {
+            frameEntity.addChild(guide)
+        }
+        
+        return frameEntity
+    }
+    
+    private func create2DFrameEdges(size: SIMD3<Float>, thickness: Float, color: UIColor) -> [ModelEntity] {
+        var edges: [ModelEntity] = []
+        // Use SimpleMaterial for better visibility
+        let material = SimpleMaterial(color: color, isMetallic: false)
+        
+        let halfWidth = size.x / 2
+        let halfHeight = size.y / 2
+        
+        // Create thicker, more visible edges
+        let edgeThickness: Float = 0.05 // 5cm thick for better visibility
+        
+        // Top edge
+        let topEdge = ModelEntity(mesh: MeshResource.generateBox(width: size.x, height: edgeThickness, depth: edgeThickness), materials: [material])
+        topEdge.position = SIMD3<Float>(0, halfHeight, 0)
+        edges.append(topEdge)
+        
+        // Bottom edge
+        let bottomEdge = ModelEntity(mesh: MeshResource.generateBox(width: size.x, height: edgeThickness, depth: edgeThickness), materials: [material])
+        bottomEdge.position = SIMD3<Float>(0, -halfHeight, 0)
+        edges.append(bottomEdge)
+        
+        // Left edge
+        let leftEdge = ModelEntity(mesh: MeshResource.generateBox(width: edgeThickness, height: size.y, depth: edgeThickness), materials: [material])
+        leftEdge.position = SIMD3<Float>(-halfWidth, 0, 0)
+        edges.append(leftEdge)
+        
+        // Right edge
+        let rightEdge = ModelEntity(mesh: MeshResource.generateBox(width: edgeThickness, height: size.y, depth: edgeThickness), materials: [material])
+        rightEdge.position = SIMD3<Float>(halfWidth, 0, 0)
+        edges.append(rightEdge)
+        
+        // Add corner spheres for better visibility
+        let cornerRadius: Float = edgeThickness * 1.5
+        let cornerMaterial = SimpleMaterial(color: color, isMetallic: false)
+        
+        // Create 4 corner spheres
+        let corners = [
+            SIMD3<Float>(-halfWidth, -halfHeight, 0), // bottom-left
+            SIMD3<Float>( halfWidth, -halfHeight, 0), // bottom-right
+            SIMD3<Float>( halfWidth,  halfHeight, 0), // top-right
+            SIMD3<Float>(-halfWidth,  halfHeight, 0)  // top-left
+        ]
+        
+        for corner in corners {
+            let cornerSphere = ModelEntity(mesh: MeshResource.generateSphere(radius: cornerRadius), materials: [cornerMaterial])
+            cornerSphere.position = corner
+            edges.append(cornerSphere)
+        }
+        
+        return edges
+    }
+    
+    private func createRuleOfThirdsGuides(size: SIMD3<Float>, thickness: Float, color: UIColor) -> [ModelEntity] {
+        var guides: [ModelEntity] = []
+        let material = SimpleMaterial(color: color, isMetallic: false)
+        
+        let halfWidth = size.x / 2
+        let halfHeight = size.y / 2
+        let thirdWidth = size.x / 3
+        let thirdHeight = size.y / 3
+        
+        // Vertical guides at 1/3 and 2/3
+        let leftGuide = ModelEntity(mesh: MeshResource.generateBox(width: thickness, height: size.y, depth: thickness), materials: [material])
+        leftGuide.position = SIMD3<Float>(-thirdWidth / 2, 0, 0)
+        guides.append(leftGuide)
+        
+        let rightGuide = ModelEntity(mesh: MeshResource.generateBox(width: thickness, height: size.y, depth: thickness), materials: [material])
+        rightGuide.position = SIMD3<Float>(thirdWidth / 2, 0, 0)
+        guides.append(rightGuide)
+        
+        // Horizontal guides at 1/3 and 2/3
+        let topGuide = ModelEntity(mesh: MeshResource.generateBox(width: size.x, height: thickness, depth: thickness), materials: [material])
+        topGuide.position = SIMD3<Float>(0, thirdHeight / 2, 0)
+        guides.append(topGuide)
+        
+        let bottomGuide = ModelEntity(mesh: MeshResource.generateBox(width: size.x, height: thickness, depth: thickness), materials: [material])
+        bottomGuide.position = SIMD3<Float>(0, -thirdHeight / 2, 0)
+        guides.append(bottomGuide)
+        
+        return guides
     }
     
     private func createWireframeEdges(size: SIMD3<Float>, thickness: Float, color: UIColor) -> [ModelEntity] {
@@ -1790,7 +2080,6 @@ class GuidanceBoxRenderer {
     func showGuidanceBox(_ guidanceBox: GuidanceBox, in arView: ARView) {
         print("🎯 GuidanceBoxRenderer.showGuidanceBox called")
         print("   Target Position: \(guidanceBox.targetPosition)")
-        print("   Relative Offset: \(guidanceBox.subjectRelativeOffset)")
         print("   Size: \(guidanceBox.size)")
         
         // Store current guidance box for position updates
@@ -1799,30 +2088,119 @@ class GuidanceBoxRenderer {
         // Remove existing guidance
         hideGuidanceBox(in: arView)
         
-        // Create new guidance anchor at initial position
+        // Get camera transform for orientation
+        guard let frame = arView.session.currentFrame else {
+            print("   ❌ No current AR frame available")
+            return
+        }
+        
+        let cameraTransform = frame.camera.transform
+        let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+        
+        // Create new guidance anchor at the target position
         guidanceAnchor = AnchorEntity(world: guidanceBox.targetPosition)
-        print("   ✅ Created anchor at world position: \(guidanceBox.targetPosition)")
+        print("   ✅ Created anchor at position: \(guidanceBox.targetPosition)")
         
         // Create box entity
         boxEntity = createGuidanceBoxEntity(guidanceBox: guidanceBox)
-        print("   ✅ Created box entity")
+        print("   ✅ Created framing box entity")
         
         if let anchor = guidanceAnchor, let entity = boxEntity {
+            // Calculate rotation to face the camera (billboard effect)
+            let direction = normalize(cameraPosition - guidanceBox.targetPosition)
+            
+            // Create a look-at rotation
+            // We want the frame to face the camera, so the forward vector points toward camera
+            let up = SIMD3<Float>(0, 1, 0)  // World up
+            let right = normalize(cross(up, direction))
+            let adjustedUp = cross(direction, right)
+            
+            // Create rotation matrix
+            var rotationMatrix = simd_float4x4()
+            rotationMatrix.columns.0 = SIMD4<Float>(right.x, right.y, right.z, 0)
+            rotationMatrix.columns.1 = SIMD4<Float>(adjustedUp.x, adjustedUp.y, adjustedUp.z, 0)
+            rotationMatrix.columns.2 = SIMD4<Float>(direction.x, direction.y, direction.z, 0)
+            rotationMatrix.columns.3 = SIMD4<Float>(0, 0, 0, 1)
+            
+            // Apply rotation to entity
+            entity.transform.matrix = rotationMatrix
+            
+            // Add entity to anchor
             anchor.addChild(entity)
             arView.scene.addAnchor(anchor)
-            print("   ✅ Added box to AR scene")
+            print("   ✅ Added framing box to AR scene")
+            print("   ✅ Frame oriented to face camera")
             
-            // Add subtle scale for visibility
-            entity.transform.scale = SIMD3<Float>(1.0, 1.0, 1.0)
+            // Add center point indicator (small sphere)
+            let centerIndicator = ModelEntity(
+                mesh: MeshResource.generateSphere(radius: 0.05),
+                materials: [SimpleMaterial(color: .green, isMetallic: false)]
+            )
+            centerIndicator.position = SIMD3<Float>(0, 0, 0.01)  // Slightly in front
+            entity.addChild(centerIndicator)
             
             // Verify anchor is in scene
             if arView.scene.anchors.contains(where: { $0 === anchor }) {
-                print("   ✅ Confirmed: Anchor is in AR scene")
-            } else {
-                print("   ❌ Error: Anchor not found in AR scene after adding")
+                print("   ✅ Confirmed: Framing box is active in AR scene")
             }
         } else {
             print("   ❌ Error: Failed to create anchor or entity")
+        }
+    }
+    
+    func updateGuidanceBoxAlignment(subjectBounds: SubjectBounds, cameraTransform: simd_float4x4, in arView: ARView) {
+        guard let guidanceBox = currentGuidanceBox,
+              let anchor = guidanceAnchor,
+              let entity = boxEntity else { return }
+        
+        // Calculate alignment quality based on:
+        // 1. Distance from ideal position
+        // 2. Subject centering in frame
+        // 3. Size matching
+        
+        let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+        let cameraForward = -SIMD3<Float>(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+        
+        // Check if subject is within the guidance frame
+        let boxToSubject = subjectBounds.center - guidanceBox.targetPosition
+        let lateralDistance = sqrt(boxToSubject.x * boxToSubject.x + boxToSubject.y * boxToSubject.y)
+        
+        // Calculate how centered the subject is (0 = perfect, 1 = at edge of frame)
+        let halfFrameSize = guidanceBox.size.x / 2
+        let centeringScore = 1.0 - min(lateralDistance / halfFrameSize, 1.0)
+        
+        // Calculate distance alignment
+        let currentDistance = simd_length(subjectBounds.center - cameraPosition)
+        let targetDistance = simd_length(guidanceBox.targetPosition - cameraPosition)
+        let distanceError = abs(currentDistance - targetDistance)
+        let distanceScore = 1.0 - min(distanceError / 2.0, 1.0)  // 2m tolerance
+        
+        // Combined alignment quality
+        let alignmentQuality = Float((centeringScore + distanceScore) / 2.0)
+        
+        // Only update if quality changed significantly
+        if abs(alignmentQuality - lastAlignmentQuality) > 0.1 {
+            lastAlignmentQuality = alignmentQuality
+            
+            // Recreate entity with new color
+            entity.removeFromParent()
+            let newEntity = createGuidanceBoxEntity(guidanceBox: guidanceBox, alignmentQuality: alignmentQuality)
+            
+            // Apply same rotation as before
+            let direction = normalize(cameraPosition - guidanceBox.targetPosition)
+            let up = SIMD3<Float>(0, 1, 0)
+            let right = normalize(cross(up, direction))
+            let adjustedUp = cross(direction, right)
+            
+            var rotationMatrix = simd_float4x4()
+            rotationMatrix.columns.0 = SIMD4<Float>(right.x, right.y, right.z, 0)
+            rotationMatrix.columns.1 = SIMD4<Float>(adjustedUp.x, adjustedUp.y, adjustedUp.z, 0)
+            rotationMatrix.columns.2 = SIMD4<Float>(direction.x, direction.y, direction.z, 0)
+            rotationMatrix.columns.3 = SIMD4<Float>(0, 0, 0, 1)
+            
+            newEntity.transform.matrix = rotationMatrix
+            anchor.addChild(newEntity)
+            boxEntity = newEntity
         }
     }
     
@@ -1842,38 +2220,15 @@ class GuidanceBoxRenderer {
             return
         }
         
-        // Update position smoothly
-        let currentTransform = anchor.transform
-        let targetTransform = Transform(
-            scale: currentTransform.scale,
-            rotation: currentTransform.rotation,
-            translation: guidanceBox.targetPosition
-        )
-        
-        // Animate to new position
-        anchor.move(to: targetTransform, relativeTo: nil, duration: 0.5)
+        // For stationary 2D frame, we don't update position after initial placement
+        // The frame stays fixed in world space so users can align their camera with it
     }
     
     // Update box position based on current subject position
     func updateBoxPositionForSubject(subjectBounds: SubjectBounds, in arView: ARView) {
-        guard let guidanceBox = currentGuidanceBox,
-              let anchor = guidanceAnchor else {
-            return
-        }
-        
-        // Calculate new world position based on current subject center and stored offset
-        let newWorldPosition = guidanceBox.currentWorldPosition(subjectCenter: subjectBounds.center)
-        
-        // Update position smoothly
-        let currentTransform = anchor.transform
-        let targetTransform = Transform(
-            scale: currentTransform.scale,
-            rotation: currentTransform.rotation,
-            translation: newWorldPosition
-        )
-        
-        // Animate to new position (faster animation for real-time tracking)
-        anchor.move(to: targetTransform, relativeTo: nil, duration: 0.2)
+        // For stationary 2D frame, we don't update position after initial placement
+        // The frame stays fixed in world space so users can align their camera with it
+        return
     }
 }
 
@@ -2235,6 +2590,48 @@ struct SettingsView: View {
             .foregroundColor(.secondary)
         }
         
+        Section(header: Text("Performance Metrics")) {
+          if viewModel.performanceMetrics.isEmpty {
+            Text("No metrics recorded yet")
+              .foregroundColor(.secondary)
+          } else {
+            ForEach(viewModel.performanceMetrics.reversed()) { metric in
+              VStack(alignment: .leading, spacing: 4) {
+                Text(metric.timestamp, style: .date)
+                  .font(.caption.bold())
+                HStack(spacing: 16) {
+                  VStack(alignment: .leading, spacing: 2) {
+                    Text("Button→API: \(metric.formattedTimes.buttonToAPI)")
+                      .font(.caption2)
+                    Text("API Response: \(metric.formattedTimes.apiResponse)")
+                      .font(.caption2)
+                  }
+                  VStack(alignment: .leading, spacing: 2) {
+                    Text("Box Placement: \(metric.formattedTimes.boxPlacement)")
+                      .font(.caption2)
+                    Text("Total: \(metric.formattedTimes.total)")
+                      .font(.caption2.bold())
+                  }
+                }
+              }
+              .padding(.vertical, 4)
+            }
+          }
+          
+          if !viewModel.performanceMetrics.isEmpty {
+            Button(action: {
+              viewModel.clearPerformanceMetrics()
+            }) {
+              HStack {
+                Image(systemName: "trash")
+                  .foregroundColor(.red)
+                Text("Clear All Metrics")
+                  .foregroundColor(.red)
+              }
+            }
+          }
+        }
+        
         Section(header: Text("About")) {
           HStack {
             Text("Version")
@@ -2266,6 +2663,8 @@ struct ReferenceImageMetadata: Codable, Equatable {
     var cameraRollDeg: String
     var cameraPitchDeg: String
     var cameraYawDeg: String
+    var subjectRelativePitchDeg: String
+    var subjectRelativeYawDeg: String
     var cameraFOVHDeg: String
     var ambientLux: String
     var colorTempK: String
@@ -2282,6 +2681,8 @@ struct ReferenceImageMetadata: Codable, Equatable {
             cameraRollDeg: "",
             cameraPitchDeg: "",
             cameraYawDeg: "",
+            subjectRelativePitchDeg: "",
+            subjectRelativeYawDeg: "",
             cameraFOVHDeg: "",
             ambientLux: "",
             colorTempK: "",
@@ -2548,6 +2949,8 @@ struct ReferenceImageMetadataInputView: View {
                             cameraRollDeg: "",
                             cameraPitchDeg: "",
                             cameraYawDeg: "",
+                            subjectRelativePitchDeg: "",
+                            subjectRelativeYawDeg: "",
                             cameraFOVHDeg: "",
                             ambientLux: "",
                             colorTempK: "",
@@ -2570,6 +2973,29 @@ struct ReferenceImageMetadataInputView: View {
     }
 }
 private let dateFormatter: DateFormatter = { let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short; return df }()
+
+// MARK: - Performance Tracking
+struct PerformanceMetric: Identifiable, Codable {
+    let id = UUID()
+    let timestamp: Date
+    var buttonPressToAPICall: TimeInterval?
+    var apiResponseTime: TimeInterval?
+    var boxPlacementTime: TimeInterval?
+    var totalTime: TimeInterval?
+    
+    var formattedTimes: (buttonToAPI: String, apiResponse: String, boxPlacement: String, total: String) {
+        let formatter = { (time: TimeInterval?) -> String in
+            guard let time = time else { return "N/A" }
+            return String(format: "%.2fs", time)
+        }
+        return (
+            buttonToAPI: formatter(buttonPressToAPICall),
+            apiResponse: formatter(apiResponseTime),
+            boxPlacement: formatter(boxPlacementTime),
+            total: formatter(totalTime)
+        )
+    }
+}
 
 // MARK: - Box Placement (Model, ViewModel, UI)
 struct PlacedBox: Identifiable, Codable, Equatable { let id: UUID; let offset: SIMD3<Float>; let dateAdded: Date }
