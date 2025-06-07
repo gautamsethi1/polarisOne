@@ -390,40 +390,34 @@ final class ARViewModel: ObservableObject {
             "x": {
               "direction": "left|right|no change",
               "magnitude": 0.5,
-              "unit": "m",
-              "description": "Move 0.5m left to center subject"
+              "unit": "m"
             },
             "y": {
               "direction": "up|down|no change",
               "magnitude": 0.2,
-              "unit": "m",
-              "description": "Move 0.2m up for better eye level"
+              "unit": "m"
             },
             "z": {
               "direction": "forward|back|no change",
               "magnitude": 1.0,
-              "unit": "m",
-              "description": "Move 1.0m forward to match subject size"
+              "unit": "m"
             }
           },
           "rotation": {
             "yaw": {
               "direction": "left|right|no change",
               "magnitude": 15,
-              "unit": "deg",
-              "description": "Turn 15° left to match angle"
+              "unit": "deg"
             },
             "pitch": {
               "direction": "up|down|no change",
               "magnitude": 5,
-              "unit": "deg",
-              "description": "Tilt 5° up for proper framing"
+              "unit": "deg"
             },
             "roll": {
               "direction": "clockwise|counter-clockwise|no change",
               "magnitude": 0,
-              "unit": "deg",
-              "description": "Level the camera"
+              "unit": "deg"
             }
           },
           "framing": {
@@ -2445,6 +2439,11 @@ class APIService {
         "contents": [
             ["parts": [["text": prompt]]]
         ],
+        "generationConfig": [
+            "thinkingConfig": [
+                "thinkingBudget": 0
+            ]
+        ]
     ]
     var request = URLRequest(url: url)
     request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
