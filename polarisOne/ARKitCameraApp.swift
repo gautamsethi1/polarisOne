@@ -1,5 +1,3 @@
-//
-//  ARKitCameraApp.swift
 //  polarisOne
 /*
  ARKitCameraApp.swift – Self‑contained SwiftUI + RealityKit demo
@@ -7,8 +5,7 @@
  • Live plane & mesh visualisation
  • Body detection with distance calculation
  • One‑tap USDZ export via share‑sheet (LiDAR only)
- • Integrated call to Flash 2.0 Image Generation Model
- • Integrated call to Flash 2.0 Text Generation Model
+ • Integrated call to Flash 2.5 Generation Model
  -----------------------------------------------------------------
  Xcode 15 / iOS 17. Run on a real device (A12 Bionic+).
 
@@ -28,6 +25,7 @@ import simd // simd_float4x4
 import Combine
 import AVFoundation // Added for AVCaptureDevice
 import Vision // For ML-based human detection
+import CoreMotion // For device motion (Apple-style levels)
 
 // MARK: - Potential File: Extensions/URL+Identifiable.swift
 // MARK: – Convenience so URL works with .sheet(item:)
@@ -44,707 +42,6 @@ struct ARKitCameraApp: App {
 
 // MARK: - Potential File: ViewModels/ARViewModel.swift
 // MARK: – ObservableObject bridging ARSession → SwiftUI
-final class ARViewModel: ObservableObject {
-  @Published var shareURL: URL?
-  @Published var distanceToPerson: String = "Looking for subjects..."
-  @Published var detectedSubjectCount: Int = 0
-
-  @Published var cameraHeightRelativeToEyes: String = "Eyes: N/A"
-  @Published var generalCameraHeight: String = "Cam Height: N/A"
-  @Published var visibleBodyPartsInfo: String = "Visible Parts: N/A"
-  @Published var bodyTrackingHint: String = ""
-  @Published var isBodyTrackingActive: Bool = false
-
-  @Published var isCapturing: Bool = false
-  @Published var showResponses: Bool = false
-
-  @Published var selectedReferenceImage: ReferenceImage? = nil
-  @Published var generatedImage: UIImage?
-  @Published var isGeneratingPhoto: Bool = false
-
-  
-  // --- Settings ---
-  @Published var showDetailedMetrics: Bool = true
-  @Published var showSettings: Bool = false
-
-  // --- New Camera/Scene Properties ---
-  @Published var cameraRoll: Float?
-  @Published var cameraPitch: Float?
-  @Published var cameraYaw: Float?
-  @Published var fieldOfViewHorizontalDeg: Float?
-  @Published var ambientIntensityLux: Float?
-  @Published var ambientColorTemperatureKelvin: Float?
-  
-  // Subject-relative camera angles
-  @Published var subjectRelativePitch: Float? // Angle from horizontal plane through subject
-  @Published var subjectRelativeYaw: Float?   // Angle from front-facing subject direction
-
-  // Computed properties for display strings
-  var cameraOrientationDegString: String {
-    guard let roll = cameraRoll, let pitch = cameraPitch, let yaw = cameraYaw else { return "Orientation: N/A" }
-    // ARCamera.eulerAngles provides: pitch (around X), yaw (around Y), roll (around Z).
-    // Standard display order is often Roll, Pitch, Yaw.
-    // Note: Negating roll to match expected convention (positive roll = clockwise when looking forward)
-    return String(format: "R:%.0f° P:%.0f° Y:%.0f°", -roll * 180 / .pi, pitch * 180 / .pi, yaw * 180 / .pi)
-  }
-  var fieldOfViewDegString: String {
-    guard let fov = fieldOfViewHorizontalDeg else { return "FOV H: N/A" }
-    return String(format: "FOV H: %.1f°", fov)
-  }
-  var ambientLuxString: String {
-    guard let lux = ambientIntensityLux else { return "Lux: N/A" }
-    return String(format: "Lux: %.0f", lux)
-  }
-  var colorTempKString: String {
-    guard let temp = ambientColorTemperatureKelvin else { return "Color K: N/A" }
-    return String(format: "Color K: %.0f", temp)
-  }
-  
-  var subjectRelativeOrientationString: String {
-    guard let pitch = subjectRelativePitch, let yaw = subjectRelativeYaw else { return "Subject Angles: N/A" }
-    return String(format: "P:%.0f° Y:%.0f°", pitch * 180 / .pi, yaw * 180 / .pi)
-  }
-  
-  // Store the latest structured response for potential UI use
-  @Published var latestStructuredGuidance: StructuredGeminiResponse? = nil
-  
-  // Subject detection and guidance state
-  @Published var currentSubjectBounds: SubjectBounds? = nil
-  @Published var activeGuidanceBox: GuidanceBox? = nil
-  @Published var isGuidanceActive: Bool = false
-  @Published var guidanceSubjectScreenBounds: CGRect = .zero  // 2D screen bounds for overlay
-  @Published var guidanceDirections: GuidanceDirections = GuidanceDirections()
-  @Published var guidanceAlignmentScore: Float = 0.0
-  
-  // Performance metrics
-  @Published var performanceMetrics: [PerformanceMetric] = []
-  
-  private let performanceMetricsKey = "ARViewModelPerformanceMetrics"
-  
-  init() {
-    loadPerformanceMetrics()
-  }
-  
-  func savePerformanceMetrics() {
-    if let encoded = try? JSONEncoder().encode(performanceMetrics) {
-      UserDefaults.standard.set(encoded, forKey: performanceMetricsKey)
-    }
-  }
-  
-  func loadPerformanceMetrics() {
-    if let data = UserDefaults.standard.data(forKey: performanceMetricsKey),
-       let metrics = try? JSONDecoder().decode([PerformanceMetric].self, from: data) {
-      performanceMetrics = metrics
-    }
-  }
-  
-  func clearPerformanceMetrics() {
-    performanceMetrics = []
-    UserDefaults.standard.removeObject(forKey: performanceMetricsKey)
-  }
-  
-  // Calculate camera orientation relative to subject
-  func calculateSubjectRelativeOrientation(cameraTransform: matrix_float4x4, subjectCenter: SIMD3<Float>) {
-    let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
-    
-    // Vector from camera to subject
-    let toSubject = subjectCenter - cameraPosition
-    let horizontalDistance = sqrt(toSubject.x * toSubject.x + toSubject.z * toSubject.z)
-    
-    // Calculate pitch: angle from horizontal plane
-    // Positive pitch = camera looking down, negative = looking up
-    if horizontalDistance > 0.01 {
-      let pitchRad = atan2(-toSubject.y, horizontalDistance)
-      subjectRelativePitch = pitchRad
-    }
-    
-    // Calculate yaw: horizontal angle from camera to subject
-    // 0° = subject directly in front, positive = subject to the right
-    let yawRad = atan2(toSubject.x, -toSubject.z)
-    subjectRelativeYaw = yawRad
-  }
-
-
-
-  private func getFinalCameraHeightForPrompt() -> (stringValue: String, numericValue: Double?) {
-      var cameraHeightStringValue: String = "N/A"
-      var numericHeightValue: Double? = nil
-      let fullHeightString = generalCameraHeight
-      if fullHeightString.lowercased().contains("n/a") {
-          cameraHeightStringValue = "N/A"
-      } else {
-          let components = fullHeightString.components(separatedBy: .whitespaces)
-          if components.count >= 3 {
-              let heightPart = components[2]
-              let numericString = heightPart.replacingOccurrences(of: "m", with: "")
-              if let numValue = Double(numericString) {
-                  cameraHeightStringValue = numericString
-                  numericHeightValue = numValue
-              }
-          }
-      }
-      var finalPromptString = cameraHeightStringValue
-      if let numHeight = numericHeightValue, numHeight < -0.05 {
-          if generalCameraHeight.lowercased().contains("low?") {
-              finalPromptString = "\(cameraHeightStringValue)m (potentially low)"
-          } else if numHeight < -0.19 && generalCameraHeight.lowercased().contains("origin") {
-              finalPromptString = "approx. 0m (origin likely high or detection issue)"
-          } else {
-              finalPromptString = "\(cameraHeightStringValue)m"
-          }
-      } else if cameraHeightStringValue == "N/A" {
-          finalPromptString = "unknown (AR not ready)"
-      } else if numericHeightValue != nil {
-           finalPromptString = "\(cameraHeightStringValue)m"
-      }
-      return (finalPromptString, numericHeightValue)
-  }
-  
-  func capturePhotoWithMetrics() {
-    guard let arView = ARMeshExporter.arView else {
-      self.bodyTrackingHint = "AR system not ready for capture."
-      return
-    }
-    
-    isCapturing = true
-    
-    // Capture current AR view
-    let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
-    let capturedImage = renderer.image { ctx in
-      arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
-    }
-    
-    // Get current metrics
-    let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
-    let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
-    
-    // Extract eyeline distance from cameraHeightRelativeToEyes
-    var eyelineDistance = ""
-    if cameraHeightRelativeToEyes.contains("Cam") && cameraHeightRelativeToEyes.contains("m") {
-      let components = cameraHeightRelativeToEyes.components(separatedBy: " ")
-      if components.count >= 3 {
-        eyelineDistance = components[2].replacingOccurrences(of: "m", with: "")
-      }
-    }
-    
-    // Create metadata with all current metrics
-    let metadata = ReferenceImageMetadata(
-      distanceFromCamera: distanceStringValue,
-      distanceBelowEyeline: eyelineDistance,
-      cameraHeight: finalCameraHeightForPrompt.replacingOccurrences(of: "m", with: "").replacingOccurrences(of: " (unknown AR not ready)", with: ""),
-      cameraHeightRelativeToEyes: cameraHeightRelativeToEyes,
-      visibleBodyParts: visibleBodyPartsInfo,
-      detectedSubjectCount: "\(detectedSubjectCount)",
-      cameraRollDeg: cameraRoll != nil ? String(format: "%.1f", -cameraRoll! * 180 / .pi) : "N/A",
-      cameraPitchDeg: cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A",
-      cameraYawDeg: cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A",
-      subjectRelativePitchDeg: subjectRelativePitch != nil ? String(format: "%.1f", subjectRelativePitch! * 180 / .pi) : "N/A",
-      subjectRelativeYawDeg: subjectRelativeYaw != nil ? String(format: "%.1f", subjectRelativeYaw! * 180 / .pi) : "N/A",
-      cameraFOVHDeg: fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A",
-      ambientLux: ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A",
-      colorTempK: ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A",
-      captureDate: Date()
-    )
-    
-    // Save to reference images
-    if let savedRef = ReferenceImageManager.shared.saveImage(capturedImage, metadata: metadata) {
-      DispatchQueue.main.async {
-        self.selectedReferenceImage = savedRef
-        self.bodyTrackingHint = "Photo captured with metrics and saved to library"
-        self.isCapturing = false
-        
-        // Notify reference view model to reload if it exists
-        NotificationCenter.default.post(name: Notification.Name("RefreshReferenceImages"), object: nil)
-      }
-    } else {
-      DispatchQueue.main.async {
-        self.bodyTrackingHint = "Failed to save captured photo"
-        self.isCapturing = false
-      }
-    }
-  }
-  
-  func analyzeScene() {
-    guard let arView = ARMeshExporter.arView else {
-      self.bodyTrackingHint = "AR system not ready."
-      return
-    }
-    
-    isCapturing = true
-    
-    // Start performance tracking
-    let startTime = Date()
-    var currentMetric = PerformanceMetric(timestamp: startTime)
-    
-    // Capture current AR view
-    let renderer = UIGraphicsImageRenderer(size: arView.bounds.size)
-    let currentImage = renderer.image { ctx in
-      arView.drawHierarchy(in: arView.bounds, afterScreenUpdates: true)
-    }
-    
-    // Get reference image if available
-    let referenceImage: UIImage
-    let hasReference = selectedReferenceImage?.image != nil
-    
-    if let refImageContainer = selectedReferenceImage, let refImage = refImageContainer.image {
-      referenceImage = refImage
-    } else {
-      // Use current image as both reference and current if no reference is set
-      referenceImage = currentImage
-    }
-    
-    // Prepare metrics
-    let (finalCameraHeightForPrompt, _) = getFinalCameraHeightForPrompt()
-    let distanceStringValue = distanceToPerson.components(separatedBy: " ")[0]
-    
-    let rollDeg = cameraRoll != nil ? String(format: "%.1f", -cameraRoll! * 180 / .pi) : "N/A"
-    let pitchDeg = cameraPitch != nil ? String(format: "%.1f", cameraPitch! * 180 / .pi) : "N/A"
-    let yawDeg = cameraYaw != nil ? String(format: "%.1f", cameraYaw! * 180 / .pi) : "N/A"
-    let orientationPrompt = "R:\(rollDeg)°, P:\(pitchDeg)°, Y:\(yawDeg)°"
-    
-    // Subject-relative angles
-    let subjectPitchDeg = subjectRelativePitch != nil ? String(format: "%.1f", subjectRelativePitch! * 180 / .pi) : "N/A"
-    let subjectYawDeg = subjectRelativeYaw != nil ? String(format: "%.1f", subjectRelativeYaw! * 180 / .pi) : "N/A"
-    let subjectOrientationPrompt = "P:\(subjectPitchDeg)°, Y:\(subjectYawDeg)°"
-    
-    var currentMetrics: [String: String] = [
-        "distance_to_person_meters": distanceStringValue,
-        "camera_height_meters": finalCameraHeightForPrompt,
-        "camera_height_raw_string": generalCameraHeight,
-        "camera_height_relative_to_eyes": cameraHeightRelativeToEyes,
-        "visible_body_parts": visibleBodyPartsInfo,
-        "detected_subject_count": "\(detectedSubjectCount)",
-        "camera_roll_deg": rollDeg,
-        "camera_pitch_deg": pitchDeg,
-        "camera_yaw_deg": yawDeg,
-        "subject_relative_pitch_deg": subjectPitchDeg,
-        "subject_relative_yaw_deg": subjectYawDeg,
-        "camera_fov_h_deg": fieldOfViewHorizontalDeg != nil ? String(format: "%.1f", fieldOfViewHorizontalDeg!) : "N/A",
-        "ambient_lux": ambientIntensityLux != nil ? String(format: "%.0f", ambientIntensityLux!) : "N/A",
-        "color_temp_k": ambientColorTemperatureKelvin != nil ? String(format: "%.0f", ambientColorTemperatureKelvin!) : "N/A"
-    ]
-    
-    // Build prompt based on whether we have a reference image
-    let prompt: String
-    
-    if hasReference, let refImageContainer = selectedReferenceImage {
-      // We have a reference image - provide comparison guidance
-      let refMeta = refImageContainer.metadata
-      let distCam = refMeta.distanceFromCamera.isEmpty ? "N/A" : "\(refMeta.distanceFromCamera)m"
-      let camHeight = refMeta.cameraHeight.isEmpty ? "N/A" : "\(refMeta.cameraHeight)m"
-      let belowEyeline = refMeta.distanceBelowEyeline.isEmpty ? "N/A" : "\(refMeta.distanceBelowEyeline)m (camera below subject's eyes)"
-      
-      let photo1Details = """
-      - Subject distance from camera: \(distCam)
-      - Camera height: \(camHeight)
-      - Camera position relative to subject's eyeline: \(belowEyeline)
-      - Visible body parts: \(refMeta.visibleBodyParts.isEmpty ? "N/A" : refMeta.visibleBodyParts)
-      - Detected subject count: \(refMeta.detectedSubjectCount.isEmpty ? "N/A" : refMeta.detectedSubjectCount)
-      - Camera Orientation (Roll, Pitch, Yaw): R:\(refMeta.cameraRollDeg)°, P:\(refMeta.cameraPitchDeg)°, Y:\(refMeta.cameraYawDeg)°
-      - Subject-Relative Camera Angles (Pitch, Yaw): P:\(refMeta.subjectRelativePitchDeg)°, Y:\(refMeta.subjectRelativeYawDeg)°
-      - Camera Horizontal FOV: \(refMeta.cameraFOVHDeg.isEmpty ? "N/A" : "\(refMeta.cameraFOVHDeg)°")
-      - Ambient Light: \(refMeta.ambientLux.isEmpty ? "N/A" : "\(refMeta.ambientLux) lux")
-      - Color Temperature: \(refMeta.colorTempK.isEmpty ? "N/A" : "\(refMeta.colorTempK)K")
-      """
-      
-      let photo2Details = """
-      - Subject distance from camera: \(distanceStringValue.isEmpty ? "N/A" : "\(distanceStringValue)m")
-      - Camera height: \(finalCameraHeightForPrompt)
-      - Camera height relative to subject's eyes: \(cameraHeightRelativeToEyes)
-      - Visible body parts: \(visibleBodyPartsInfo)
-      - Detected subject count: \(detectedSubjectCount)
-      - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
-      - Subject-Relative Camera Angles (Pitch, Yaw): \(subjectOrientationPrompt)
-      - Camera Horizontal FOV: \(self.fieldOfViewDegString)
-      - Ambient Light: \(self.ambientLuxString)
-      - Color Temperature: \(self.colorTempKString)
-      """
-      
-      prompt = """
-      You are an expert photography assistant specializing in portrait composition and framing. Your goal is to help adjust the camera to achieve the same composition, framing, and perspective as a reference photo.
-
-      I will provide two images:
-      1. Photo 1: The reference image showing the desired composition
-      2. Photo 2: The current live camera view that needs adjustment
-
-      Reference Photo Details (Photo 1):
-      \(photo1Details)
-
-      Current Scene Details (Photo 2):
-      \(photo2Details)
-
-      Analyze the composition differences between the photos, focusing on:
-      - Subject positioning within the frame (rule of thirds, golden ratio)
-      - Amount of space around the subject (headroom, lead room)
-      - Subject size relative to frame
-      - Camera angle and perspective
-      - Overall framing and composition balance
-
-      Provide camera movement instructions to match Photo 1's composition.
-      
-      IMPORTANT: Respond ONLY with valid JSON in the following exact format:
-      
-      {
-        "adjustments": {
-          "translation": {
-            "x": {
-              "direction": "left|right|no change",
-              "magnitude": 0.5,
-              "unit": "m"
-            },
-            "y": {
-              "direction": "up|down|no change",
-              "magnitude": 0.2,
-              "unit": "m"
-            },
-            "z": {
-              "direction": "forward|back|no change",
-              "magnitude": 1.0,
-              "unit": "m"
-            }
-          },
-          "rotation": {
-            "yaw": {
-              "direction": "left|right|no change",
-              "magnitude": 15,
-              "unit": "deg"
-            },
-            "pitch": {
-              "direction": "up|down|no change",
-              "magnitude": 5,
-              "unit": "deg"
-            },
-            "roll": {
-              "direction": "clockwise|counter-clockwise|no change",
-              "magnitude": 0,
-              "unit": "deg"
-            }
-          },
-          "framing": {
-            "subject_position": "center|left_third|right_third|top_third|bottom_third",
-            "composition_rule": "rule_of_thirds|golden_ratio|centered|dynamic_symmetry",
-            "framing_type": "close_up|medium_shot|full_body|environmental",
-            "ideal_subject_percentage": 0.3
-          }
-        },
-        "summary": "Key adjustments for matching composition",
-        "confidence": 0.85
-      }
-      
-      Guidelines:
-      - Focus on composition and framing, not just position
-      - Consider how the subject fills the frame
-      - Account for compositional balance and visual weight
-      - Magnitude values should be realistic (0.1-3.0m for translation, 1-45° for rotation)
-      - Confidence reflects how well you can determine the needed adjustments
-      - ideal_subject_percentage is how much of the frame the subject should occupy (0.0-1.0)
-      """
-    } else {
-      // No reference image - just analyze the current scene
-      prompt = """
-      Act like an expert ARKit scene analyst and photography coach. I will provide a photo of the current AR scene and measured values about the subject and camera.
-      
-      Please provide a concise analysis (≤100 words) that includes:
-      1. Assessment of the current scene composition
-      2. Specific suggestions for improving the photo (positioning, angle, distance)
-      3. Any detected issues with tracking or visibility
-      4. Tips for better photo results
-      
-      Scene metrics:
-      - Subject distance: \(distanceStringValue) m
-      - Camera height: \(finalCameraHeightForPrompt)
-      - Height relative to eyes: \(cameraHeightRelativeToEyes)
-      - Visible body parts: \(visibleBodyPartsInfo)
-      - Detected subject count: \(detectedSubjectCount)
-      - Camera Orientation (Roll, Pitch, Yaw): \(orientationPrompt)
-      - Subject-Relative Camera Angles (Pitch, Yaw): \(subjectOrientationPrompt)
-      - Camera Horizontal FOV: \(self.fieldOfViewDegString)
-      - Ambient Light: \(self.ambientLuxString)
-      - Color Temperature: \(self.colorTempKString)
-      """
-    }
-    
-    Task {
-      do {
-        // Track time to API call
-        let apiCallStartTime = Date()
-        currentMetric.buttonPressToAPICall = apiCallStartTime.timeIntervalSince(startTime)
-        
-        if hasReference {
-          // Use structured response for reference image comparison
-          let (structuredResponse, rawJSON) = try await APIService.shared.sendStructuredImageComparisonRequest(
-            referenceImage: referenceImage,
-            currentImage: currentImage,
-            prompt: prompt,
-            additionalMetrics: currentMetrics
-          )
-          
-          // Track API response time
-          let apiResponseTime = Date()
-          currentMetric.apiResponseTime = apiResponseTime.timeIntervalSince(apiCallStartTime)
-          
-          // Format the structured response into human-readable text
-          var formattedResponse = "Photo Guidance (6 DOF Adjustments):\n\n"
-          
-          // Translation adjustments
-          formattedResponse += "POSITION ADJUSTMENTS:\n"
-          formattedResponse += "• X-axis: \(structuredResponse.adjustments.translation.x.description)\n"
-          formattedResponse += "• Y-axis: \(structuredResponse.adjustments.translation.y.description)\n"
-          formattedResponse += "• Z-axis: \(structuredResponse.adjustments.translation.z.description)\n\n"
-          
-          // Rotation adjustments
-          formattedResponse += "ROTATION ADJUSTMENTS:\n"
-          formattedResponse += "• Yaw: \(structuredResponse.adjustments.rotation.yaw.description)\n"
-          formattedResponse += "• Pitch: \(structuredResponse.adjustments.rotation.pitch.description)\n"
-          formattedResponse += "• Roll: \(structuredResponse.adjustments.rotation.roll.description)\n"
-          
-          if let summary = structuredResponse.summary {
-            formattedResponse += "\nSUMMARY: \(summary)"
-          }
-          
-          if let confidence = structuredResponse.confidence {
-            formattedResponse += "\nConfidence: \(Int(confidence * 100))%"
-          }
-          
-          let apiResponse = APIResponse(response: formattedResponse)
-          
-          await MainActor.run {
-            let viewModel = ResponsesViewModel()
-            viewModel.saveResponse(apiResponse)
-            isCapturing = false
-            showResponses = true
-            
-            // Store the structured guidance for potential UI use
-            self.latestStructuredGuidance = structuredResponse
-            
-            // Trigger guidance box creation if we have subject bounds
-            if let subjectBounds = self.currentSubjectBounds {
-              print("✅ Subject bounds available, creating guidance box")
-              let boxStartTime = Date()
-              self.activateGuidanceBox(for: structuredResponse, subjectBounds: subjectBounds)
-              
-              // Track box placement time
-              currentMetric.boxPlacementTime = Date().timeIntervalSince(boxStartTime)
-              currentMetric.totalTime = Date().timeIntervalSince(startTime)
-              
-              // Save metric
-              self.performanceMetrics.append(currentMetric)
-              self.savePerformanceMetrics()
-            } else {
-              print("❌ No subject bounds available - cannot create guidance box")
-              print("💡 Ensure a human subject is detected before analyzing scene")
-              
-              // Save metric even without box placement
-              currentMetric.totalTime = Date().timeIntervalSince(startTime)
-              self.performanceMetrics.append(currentMetric)
-              self.savePerformanceMetrics()
-            }
-            
-            // Show brief hint with key adjustment
-            var keyAdjustment = "Check responses for guidance"
-            if let summary = structuredResponse.summary {
-              keyAdjustment = String(summary.prefix(60)) + "..."
-            }
-            self.bodyTrackingHint = "Photo Guidance: \(keyAdjustment)"
-          }
-        } else {
-          // Use regular text response for scene analysis without reference
-          let (responseText, _) = try await APIService.shared.sendImageGenerationRequest(
-            referenceImage: referenceImage,
-            currentImage: currentImage,
-            prompt: prompt,
-            additionalMetrics: currentMetrics
-          )
-          
-          // Track API response time
-          currentMetric.apiResponseTime = Date().timeIntervalSince(apiCallStartTime)
-          
-          let apiResponse = APIResponse(response: "Scene Analysis:\n\(responseText)")
-          
-          await MainActor.run {
-            let viewModel = ResponsesViewModel()
-            viewModel.saveResponse(apiResponse)
-            isCapturing = false
-            showResponses = true
-            
-            // Save metric for non-reference analysis
-            currentMetric.totalTime = Date().timeIntervalSince(startTime)
-            self.performanceMetrics.append(currentMetric)
-            self.savePerformanceMetrics()
-            
-            // Show brief hint
-            let previewText = responseText.prefix(60)
-            self.bodyTrackingHint = "Scene Analysis: \(previewText)... (See Responses)"
-          }
-        }
-      } catch {
-        print("Error sending analysis request: \(error)")
-        await MainActor.run {
-          isCapturing = false
-          self.bodyTrackingHint = "Analysis failed: \(error.localizedDescription)"
-        }
-      }
-    }
-  }
-  
-  // Activate guidance box based on LLM recommendations
-  func activateGuidanceBox(for guidance: StructuredGeminiResponse, subjectBounds: SubjectBounds) {
-    guard let arView = ARMeshExporter.arView else { 
-      print("❌ activateGuidanceBox: ARView is nil")
-      return 
-    }
-    
-    print("✅ activateGuidanceBox called with subject at: \(subjectBounds.center)")
-    print("📐 Subject size: \(subjectBounds.size)")
-    
-    // Get current camera transform
-    guard let frame = arView.session.currentFrame else { return }
-    let cameraTransform = frame.camera.transform
-    
-    // Calculate optimal framing position based on subject and LLM guidance
-    let (targetPosition, targetDistance) = GuidanceBoxService.shared.calculateOptimalFramingPosition(
-      currentSubjectBounds: subjectBounds,
-      recommendations: guidance.adjustments,
-      cameraTransform: cameraTransform
-    )
-    
-    // Create guidance box data (keeping for compatibility)
-    let guidanceBox = GuidanceBoxService.shared.createGuidanceBox(
-      targetPosition: targetPosition,
-      targetDistance: targetDistance,
-      subjectBounds: subjectBounds,
-      recommendations: guidance.adjustments,
-      cameraTransform: cameraTransform
-    )
-    
-    // Update state
-    activeGuidanceBox = guidanceBox
-    isGuidanceActive = true
-    
-    // Calculate 2D guidance directions from LLM recommendations
-    updateGuidanceDirections(from: guidance.adjustments)
-    
-    // Convert subject bounds to screen coordinates
-    if let screenBounds = convertToScreenBounds(worldBounds: subjectBounds, frame: frame) {
-      guidanceSubjectScreenBounds = screenBounds
-    }
-    
-    bodyTrackingHint = "Follow the arrows to align your shot"
-    print("✅ 2D Guidance activated")
-  }
-  
-  private func updateGuidanceDirections(from adjustments: DOFAdjustment) {
-    var directions = GuidanceDirections()
-    
-    // Translation adjustments
-    if let xMag = adjustments.translation.x.magnitude, xMag > 0 {
-      if adjustments.translation.x.direction == "left" {
-        directions.moveLeft = Float(xMag)
-      } else if adjustments.translation.x.direction == "right" {
-        directions.moveRight = Float(xMag)
-      }
-    }
-    
-    if let yMag = adjustments.translation.y.magnitude, yMag > 0 {
-      if adjustments.translation.y.direction == "up" {
-        directions.moveUp = Float(yMag)
-      } else if adjustments.translation.y.direction == "down" {
-        directions.moveDown = Float(yMag)
-      }
-    }
-    
-    if let zMag = adjustments.translation.z.magnitude, zMag > 0 {
-      if adjustments.translation.z.direction == "forward" {
-        directions.moveForward = Float(zMag)
-      } else if adjustments.translation.z.direction == "back" {
-        directions.moveBack = Float(zMag)
-      }
-    }
-    
-    // Rotation adjustments
-    if let yawMag = adjustments.rotation.yaw.magnitude, yawMag > 0 {
-      if adjustments.rotation.yaw.direction == "left" {
-        directions.turnLeft = Float(yawMag)
-      } else if adjustments.rotation.yaw.direction == "right" {
-        directions.turnRight = Float(yawMag)
-      }
-    }
-    
-    if let pitchMag = adjustments.rotation.pitch.magnitude, pitchMag > 0 {
-      if adjustments.rotation.pitch.direction == "up" {
-        directions.tiltUp = Float(pitchMag)
-      } else if adjustments.rotation.pitch.direction == "down" {
-        directions.tiltDown = Float(pitchMag)
-      }
-    }
-    
-    guidanceDirections = directions
-  }
-  
-  func convertToScreenBounds(worldBounds: SubjectBounds, frame: ARFrame) -> CGRect? {
-    guard let arView = ARMeshExporter.arView else { return nil }
-    
-    // Get screen dimensions
-    let screenSize = arView.bounds.size
-    
-    // Project 8 corners of the 3D bounding box to screen
-    let halfSize = worldBounds.size / 2
-    let corners = [
-      worldBounds.center + SIMD3<Float>(-halfSize.x, -halfSize.y, -halfSize.z),
-      worldBounds.center + SIMD3<Float>( halfSize.x, -halfSize.y, -halfSize.z),
-      worldBounds.center + SIMD3<Float>(-halfSize.x,  halfSize.y, -halfSize.z),
-      worldBounds.center + SIMD3<Float>( halfSize.x,  halfSize.y, -halfSize.z),
-      worldBounds.center + SIMD3<Float>(-halfSize.x, -halfSize.y,  halfSize.z),
-      worldBounds.center + SIMD3<Float>( halfSize.x, -halfSize.y,  halfSize.z),
-      worldBounds.center + SIMD3<Float>(-halfSize.x,  halfSize.y,  halfSize.z),
-      worldBounds.center + SIMD3<Float>( halfSize.x,  halfSize.y,  halfSize.z)
-    ]
-    
-    var minX: CGFloat = .infinity
-    var maxX: CGFloat = -.infinity
-    var minY: CGFloat = .infinity
-    var maxY: CGFloat = -.infinity
-    
-    for corner in corners {
-      let screenPoint = frame.camera.projectPoint(corner, 
-                                                  orientation: .portrait,
-                                                  viewportSize: screenSize)
-      minX = min(minX, CGFloat(screenPoint.x))
-      maxX = max(maxX, CGFloat(screenPoint.x))
-      minY = min(minY, CGFloat(screenPoint.y))
-      maxY = max(maxY, CGFloat(screenPoint.y))
-    }
-    
-    // Ensure valid bounds
-    if minX == .infinity || maxX == -.infinity || minY == .infinity || maxY == -.infinity {
-      return nil
-    }
-    
-    return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-  }
-  
-  // Toggle guidance on/off
-  func toggleGuidance() {
-    if isGuidanceActive {
-      // Disable all guidance
-      isGuidanceActive = false
-      activeGuidanceBox = nil
-      guidanceSubjectScreenBounds = .zero
-      guidanceDirections = GuidanceDirections()
-      guidanceAlignmentScore = 0
-      bodyTrackingHint = "Guidance disabled"
-    } else {
-      // Try to reactivate guidance if we have data
-      if let guidance = latestStructuredGuidance,
-         let subjectBounds = currentSubjectBounds {
-        activateGuidanceBox(for: guidance, subjectBounds: subjectBounds)
-      } else {
-        bodyTrackingHint = "No guidance data available. Analyze scene first."
-      }
-    }
-  }
-
-}
 
 // MARK: - Potential File: Views/ContentView.swift
 // MARK: – Root SwiftUI view
@@ -809,6 +106,23 @@ struct ContentView: View {
           Text(vm.fieldOfViewDegString).infoStyle(fontSize: .caption2)
           Text(vm.ambientLuxString).infoStyle(fontSize: .caption2)
           Text(vm.colorTempKString).infoStyle(fontSize: .caption2)
+        }
+        
+        // Show alignment score when guidance is active
+        if vm.isGuidanceActive && vm.guidanceAlignmentScore > 0 {
+          HStack {
+            Circle()
+              .fill(vm.guidanceAlignmentScore > 0.8 ? Color.green : 
+                    vm.guidanceAlignmentScore > 0.5 ? Color.yellow : Color.red)
+              .frame(width: 8, height: 8)
+            Text("Stability: \(Int(vm.guidanceAlignmentScore * 100))%")
+              .font(.caption)
+              .fontWeight(.semibold)
+          }
+          .padding(.vertical, 4)
+          .padding(.horizontal, 10)
+          .background(.ultraThinMaterial)
+          .cornerRadius(16)
         }
 
       }
@@ -931,582 +245,7 @@ extension View {
     }
 }
 
-
 // MARK: - Potential File: Views/ARViewContainer.swift
-struct ARViewContainer: UIViewRepresentable {
-  @ObservedObject var viewModel: ARViewModel
-  @ObservedObject var boxVM: BoxPlacementViewModel
-
-  func makeUIView(context: Context) -> ARView {
-    let view = ARView(frame: .zero)
-    ARMeshExporter.arView = view
-    context.coordinator.arView = view
-    view.session.delegate = context.coordinator
-
-    context.coordinator.fetchInitialCameraFOV()
-
-    if ARBodyTrackingConfiguration.isSupported {
-      let configuration = ARBodyTrackingConfiguration()
-      configuration.automaticSkeletonScaleEstimationEnabled = true
-      configuration.planeDetection = [.horizontal]
-      configuration.isLightEstimationEnabled = true // Enable light estimation
-      view.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
-      DispatchQueue.main.async {
-        self.viewModel.bodyTrackingHint = "Body Tracking Active"
-        self.viewModel.isBodyTrackingActive = true
-        ARMeshExporter.hasMesh = false
-      }
-      print("✅ ARBodyTrackingConfiguration enabled.")
-    } else {
-      DispatchQueue.main.async {
-        self.viewModel.bodyTrackingHint = "ARBodyTracking Not Supported. Limited features."
-        self.viewModel.isBodyTrackingActive = false
-      }
-      print("⚠️ ARBodyTrackingConfiguration not supported. Falling back to WorldTracking.")
-      let configuration = ARWorldTrackingConfiguration()
-      configuration.planeDetection = [.horizontal]
-      configuration.sceneReconstruction = .mesh
-      configuration.isLightEstimationEnabled = true // Enable light estimation
-      view.session.run(configuration)
-      ARMeshExporter.hasMesh = true
-    }
-    let coach = ARCoachingOverlayView()
-    coach.session = view.session
-    coach.goal = .tracking
-    coach.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    coach.frame = view.bounds
-    view.addSubview(coach)
-    return view
-  }
-
-  func updateUIView(_ uiView: ARView, context: Context) {}
-
-  func makeCoordinator() -> Coordinator {
-    Coordinator(vm: viewModel, boxVM: boxVM)
-  }
-
-  final class Coordinator: NSObject, ARSessionDelegate {
-    private var vm: ARViewModel
-    private var boxVM: BoxPlacementViewModel
-    weak var arView: ARView?
-    private var currentBodyAnchor: ARBodyAnchor?
-    private var currentARFrame: ARFrame?
-    private var cancellables: Set<AnyCancellable> = []
-    private var boxAnchors: [UUID: AnchorEntity] = [:]
-    
-    // Smoothing buffers for measurements
-    private var distanceBuffer: [Float] = []
-    private var heightBuffer: [Float] = []
-    private let bufferSize = 3 // Reduced for more responsive updates
-    
-    // Validation cache for fast human detection
-    private var validationCache: [UUID: Bool] = [:]
-     
-    init(vm: ARViewModel, boxVM: BoxPlacementViewModel) {
-      self.vm = vm
-      self.boxVM = boxVM
-      super.init()
-      boxVM.$boxes.sink { [weak self] boxes in self?.syncBoxes(boxes) }.store(in: &cancellables)
-      print("Coordinator Initialized")
-    }
-      
-    func fetchInitialCameraFOV() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            // Accessing AVCaptureDevice directly for ARKit's active format is not straightforward.
-            // This is a best-effort attempt; ARKit might use different settings.
-            // For a more accurate FOV used by ARKit, one might need to rely on camera intrinsics
-            // or other ARFrame properties if available and convert them.
-            // `AVCaptureDevice.activeFormat.videoFieldOfView` gives the FoV for the *current* active format
-            // of the default video device, which ARKit *likely* uses or configures similarly.
-            if let device = AVCaptureDevice.default(for: .video) {
-                let fov = device.activeFormat.videoFieldOfView // This is Float
-                DispatchQueue.main.async {
-                    self.vm.fieldOfViewHorizontalDeg = fov
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.vm.fieldOfViewHorizontalDeg = nil
-                }
-            }
-        }
-    }
-
-      
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-      currentARFrame = frame
-      calculateGeneralCameraHeight(cameraTransform: frame.camera.transform, frame: frame)
-      
-      // Update camera orientation (eulerAngles are in radians: pitch, yaw, roll)
-      let eulerAngles = frame.camera.eulerAngles
-      let newPitchRad = eulerAngles.x // Pitch around X-axis
-      let newYawRad = eulerAngles.y   // Yaw around Y-axis
-      let newRollRad = eulerAngles.z  // Roll around Z-axis
-
-      // Update light estimates
-      var newAmbientLux: Float? = nil
-      var newColorTempK: Float? = nil
-      if let lightEstimate = frame.lightEstimate {
-          // CORRECTED: Cast CGFloat to Float
-          newAmbientLux = Float(lightEstimate.ambientIntensity)
-          newColorTempK = Float(lightEstimate.ambientColorTemperature)
-      }
-      
-      // Enhanced subject detection combining ARKit and Vision
-      updateSubjectDetection(frame: frame)
-
-      DispatchQueue.main.async {
-          // Update ViewModel properties if they changed
-          // Values are stored in radians in VM, converted to degrees in computed string
-          if self.vm.cameraPitch != newPitchRad { self.vm.cameraPitch = newPitchRad }
-          if self.vm.cameraYaw != newYawRad { self.vm.cameraYaw = newYawRad }
-          if self.vm.cameraRoll != newRollRad { self.vm.cameraRoll = newRollRad }
-          
-          if self.vm.ambientIntensityLux != newAmbientLux { self.vm.ambientIntensityLux = newAmbientLux }
-          if self.vm.ambientColorTemperatureKelvin != newColorTempK { self.vm.ambientColorTemperatureKelvin = newColorTempK }
-      }
-
-      guard let bodyAnchor = self.currentBodyAnchor, vm.isBodyTrackingActive else {
-        if vm.detectedSubjectCount > 0 && vm.isBodyTrackingActive {
-            DispatchQueue.main.async {
-                self.vm.detectedSubjectCount = 0
-                self.vm.distanceToPerson = "Looking for humans..."
-                self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"
-                self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
-            }
-            // Clear smoothing buffers when tracking is lost
-            distanceBuffer.removeAll()
-        } else if !vm.isBodyTrackingActive {
-            DispatchQueue.main.async {
-                self.vm.distanceToPerson = "Body tracking N/A"
-                self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"
-                self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
-            }
-        }
-        return
-      }
-      let cameraTransform = frame.camera.transform
-      let cameraPosition = cameraTransform.translation
-      
-      // Calculate distance using multiple body joints for better accuracy
-      var distances: [Float] = []
-      
-      // Try to get hip/root position (most stable)
-      if let hipTransform = bodyAnchor.skeleton.modelTransform(for: .root) {
-        let hipWorldPos = (bodyAnchor.transform * hipTransform).translation
-        distances.append(simd_distance(cameraPosition, hipWorldPos))
-      }
-      
-      // Also consider left and right shoulder for averaging (forms chest center)
-      if let leftShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .leftShoulder),
-         let rightShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .rightShoulder) {
-        let leftShoulderPos = (bodyAnchor.transform * leftShoulderTransform).translation
-        let rightShoulderPos = (bodyAnchor.transform * rightShoulderTransform).translation
-        // Calculate chest center as midpoint between shoulders
-        let chestCenter = SIMD3<Float>(
-          (leftShoulderPos.x + rightShoulderPos.x) / 2,
-          (leftShoulderPos.y + rightShoulderPos.y) / 2,
-          (leftShoulderPos.z + rightShoulderPos.z) / 2
-        )
-        distances.append(simd_distance(cameraPosition, chestCenter))
-      }
-      
-      // Fall back to body anchor transform if no joints available
-      if distances.isEmpty {
-        let bodyPosition = bodyAnchor.transform.translation
-        distances.append(simd_distance(cameraPosition, bodyPosition))
-      }
-      
-      // Average the distances for more stable measurement
-      let averageDistance = distances.reduce(0, +) / Float(distances.count)
-      
-      // Add to smoothing buffer
-      distanceBuffer.append(averageDistance)
-      if distanceBuffer.count > bufferSize {
-        distanceBuffer.removeFirst()
-      }
-      
-      // Calculate smoothed distance
-      let smoothedDistance = distanceBuffer.reduce(0, +) / Float(distanceBuffer.count)
-      
-      // Format distance with appropriate precision
-      let distanceString: String
-      if smoothedDistance < 1.0 {
-        distanceString = String(format: "%.2f m", smoothedDistance) // More precision for close distances
-      } else {
-        distanceString = String(format: "%.1f m", smoothedDistance)
-      }
-      
-      calculateCameraHeightRelativeToEyes(bodyAnchor: bodyAnchor, cameraTransform: cameraTransform)
-      determineVisibleBodyParts(bodyAnchor: bodyAnchor, frame: frame)
-      
-      // Calculate subject bounds from ARKit body tracking
-      if let subjectBounds = SubjectDetectionService.shared.calculateARSubjectBounds(from: bodyAnchor) {
-        let updateWorldTrackingDataAndGuidance: () -> Void = { [weak self] () -> Void in
-          guard let self = self else { return }
-          self.vm.currentSubjectBounds = subjectBounds
-          
-          // Calculate subject-relative camera orientation
-          if let frame = self.currentARFrame {
-            self.vm.calculateSubjectRelativeOrientation(
-              cameraTransform: frame.camera.transform,
-              subjectCenter: subjectBounds.center
-            )
-          }
-          
-          // Update guidance for 2D overlay if active
-          if self.vm.isGuidanceActive,
-             let _ = self.arView,
-             let currentFrame = self.currentARFrame {
-            // Update 2D screen bounds for subject
-            if let screenBounds = self.vm.convertToScreenBounds(worldBounds: subjectBounds, frame: currentFrame) {
-              self.vm.guidanceSubjectScreenBounds = screenBounds
-            }
-            
-            // Calculate alignment score
-            if let activeBox = self.vm.activeGuidanceBox {
-              let cameraPosition = SIMD3<Float>(currentFrame.camera.transform.columns.3.x,
-                                                currentFrame.camera.transform.columns.3.y,
-                                                currentFrame.camera.transform.columns.3.z)
-              
-              // Distance alignment
-              let currentDistance = simd_length(subjectBounds.center - cameraPosition)
-              let targetDistance = simd_length(activeBox.targetPosition - cameraPosition)
-              let distanceError = abs(currentDistance - targetDistance)
-              let distanceScore = 1.0 - min(distanceError / 2.0, 1.0)
-              
-              // Position alignment (how centered the subject is)
-              let screenCenter = CGPoint(x: self.vm.guidanceSubjectScreenBounds.midX,
-                                         y: self.vm.guidanceSubjectScreenBounds.midY)
-              let idealCenter = CGPoint(x: self.arView!.bounds.midX,
-                                        y: self.arView!.bounds.midY)
-              let centerDistance = sqrt(pow(screenCenter.x - idealCenter.x, 2) + pow(screenCenter.y - idealCenter.y, 2))
-              let maxDistance = sqrt(pow(self.arView!.bounds.width / 2, 2) + pow(self.arView!.bounds.height / 2, 2))
-              let centerScore = 1.0 - min(centerDistance / maxDistance, 1.0)
-              
-              self.vm.guidanceAlignmentScore = Float((distanceScore + Float(centerScore)) / 2.0)
-            }
-          }
-        }
-        
-        DispatchQueue.main.async(execute: updateWorldTrackingDataAndGuidance)
-
-      }
-      
-      DispatchQueue.main.async {
-        // Always update for fresh values
-        self.vm.distanceToPerson = distanceString
-      }
-    }
-
-    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { processAnchors(anchors, session: session, event: "Added") }
-    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { processAnchors(anchors, session: session, event: "Updated") }
-    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-      var bodyAnchorRemoved = false
-      if let currentId = self.currentBodyAnchor?.identifier, anchors.contains(where: { $0.identifier == currentId }) {
-        self.currentBodyAnchor = nil; bodyAnchorRemoved = true
-        print("Tracked body anchor \(currentId) removed.")
-      }
-      
-      // Clean up validation cache for removed anchors
-      for anchor in anchors {
-        validationCache.removeValue(forKey: anchor.identifier)
-      }
-      if let currentFrame = session.currentFrame {
-         let bodyAnchorsInFrame = currentFrame.anchors.compactMap { $0 as? ARBodyAnchor }
-         DispatchQueue.main.async {
-           if self.vm.detectedSubjectCount != bodyAnchorsInFrame.count { self.vm.detectedSubjectCount = bodyAnchorsInFrame.count }
-           if bodyAnchorRemoved && bodyAnchorsInFrame.isEmpty {
-                self.vm.distanceToPerson = "Looking for humans..."; self.vm.cameraHeightRelativeToEyes = "Eyes: N/A"; self.vm.visibleBodyPartsInfo = "Visible Parts: N/A"
-           } else if bodyAnchorRemoved && !bodyAnchorsInFrame.isEmpty {
-               self.currentBodyAnchor = bodyAnchorsInFrame.first
-               print("Switched to new body anchor: \(self.currentBodyAnchor?.identifier.uuidString ?? "None") after removal.")
-           }
-         }
-      }
-    }
-
-    private func processAnchors(_ anchors: [ARAnchor], session: ARSession, event: String) {
-      for anchor in anchors where anchor is ARMeshAnchor {
-          print("----> Found MESH ANCHOR on \(event)")
-          DispatchQueue.main.async { ARMeshExporter.hasMesh = true }
-      }
-      
-      // Filter body anchors to only include validated humans
-      let bodyAnchors = anchors.compactMap { $0 as? ARBodyAnchor }
-      let validatedHumanAnchors = bodyAnchors.filter { validateHumanBody($0) }
-      
-      if !validatedHumanAnchors.isEmpty {
-        print("----> Found \(validatedHumanAnchors.count) VALIDATED HUMAN(s) on \(event)!")
-        if self.currentBodyAnchor == nil || !anchors.contains(where: { $0.identifier == self.currentBodyAnchor!.identifier }) {
-          self.currentBodyAnchor = validatedHumanAnchors.first
-           print("----> Now Tracking human body anchor: \(self.currentBodyAnchor!.identifier)")
-        }
-      }
-      
-      if let currentFrame = session.currentFrame {
-         let allBodyAnchorsInFrame = currentFrame.anchors.compactMap { $0 as? ARBodyAnchor }
-         let validatedHumansInFrame = allBodyAnchorsInFrame.filter { validateHumanBody($0) }
-         
-         DispatchQueue.main.async {
-          if self.vm.detectedSubjectCount != validatedHumansInFrame.count {
-            self.vm.detectedSubjectCount = validatedHumansInFrame.count
-            print("----> Updated Human Subject Count: \(validatedHumansInFrame.count)")
-          }
-          if validatedHumansInFrame.isEmpty && self.currentBodyAnchor != nil {
-              self.currentBodyAnchor = nil
-              print("----> No validated human bodies in frame. Cleared currentBodyAnchor.")
-          }
-         }
-      }
-    }
-    
-    // Validate that a body anchor represents a real human - FAST & PRACTICAL
-    private func validateHumanBody(_ bodyAnchor: ARBodyAnchor) -> Bool {
-      // Trust ARKit completely - it already filters for humans
-      let trustARKitCompletely = true
-      
-      if trustARKitCompletely {
-        // ARKit body tracking only detects humans, so any body anchor is valid
-        return true
-      }
-      
-      // Optional validation (disabled by default for speed)
-      // Cache validation results to avoid repeated checks
-      if let cachedResult = validationCache[bodyAnchor.identifier] {
-        return cachedResult
-      }
-      
-      let skeleton = bodyAnchor.skeleton
-      
-      // Fast check: Just verify we have at least 2 joints
-      var jointCount = 0
-      let minJoints = 2
-      
-      // Check only the most important joints first
-      if skeleton.modelTransform(for: .head) != nil { jointCount += 1 }
-      if jointCount >= minJoints { 
-        validationCache[bodyAnchor.identifier] = true
-        return true 
-      }
-      
-      if skeleton.modelTransform(for: .root) != nil { jointCount += 1 }
-      if jointCount >= minJoints { 
-        validationCache[bodyAnchor.identifier] = true
-        return true 
-      }
-      
-      if skeleton.modelTransform(for: .leftShoulder) != nil { jointCount += 1 }
-      if jointCount >= minJoints { 
-        validationCache[bodyAnchor.identifier] = true
-        return true 
-      }
-      
-      if skeleton.modelTransform(for: .rightShoulder) != nil { jointCount += 1 }
-      
-      let isValid = jointCount >= minJoints
-      validationCache[bodyAnchor.identifier] = isValid
-      
-      if !isValid {
-        print("Body validation failed: Only \(jointCount) joints tracked")
-      }
-      
-      return isValid
-    }
-
-    func calculateCameraHeightRelativeToEyes(bodyAnchor: ARBodyAnchor, cameraTransform: matrix_float4x4) {
-      // Try to get head joint first
-      guard let headJointTransform = bodyAnchor.skeleton.modelTransform(for: .head) else {
-        // Fallback: try to estimate from shoulders
-        if let leftShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .leftShoulder),
-           let rightShoulderTransform = bodyAnchor.skeleton.modelTransform(for: .rightShoulder) {
-          let leftShoulderPos = (bodyAnchor.transform * leftShoulderTransform).translation
-          let rightShoulderPos = (bodyAnchor.transform * rightShoulderTransform).translation
-          let shoulderCenter = SIMD3<Float>(
-            (leftShoulderPos.x + rightShoulderPos.x) / 2,
-            (leftShoulderPos.y + rightShoulderPos.y) / 2,
-            (leftShoulderPos.z + rightShoulderPos.z) / 2
-          )
-          let cameraWorldPosition = cameraTransform.translation
-          // Estimate eye position from shoulder center (typically ~25-30cm above shoulders)
-          let estimatedEyeWorldY = shoulderCenter.y + 0.28
-          let heightDifference = cameraWorldPosition.y - estimatedEyeWorldY
-          let directionText = heightDifference > 0.05 ? "Above" : (heightDifference < -0.05 ? "Below" : "Level with")
-          let text = String(format: "Eyes: Cam %.2fm %@ Subject", abs(heightDifference), directionText)
-          DispatchQueue.main.async {
-            // Always update for fresh values
-            self.vm.cameraHeightRelativeToEyes = text
-          }
-          return
-        }
-        DispatchQueue.main.async { self.vm.cameraHeightRelativeToEyes = "Eyes: Head Joint N/A" }
-        return
-      }
-      
-      let headWorldTransform = bodyAnchor.transform * headJointTransform
-      let headWorldPosition = headWorldTransform.translation
-      let cameraWorldPosition = cameraTransform.translation
-      
-      // More accurate eye offset estimation based on head joint
-      // Head joint is typically at the center of the head, eyes are ~5-8cm below and forward
-      let estimatedEyeYOffset: Float = -0.07 // Refined offset from head joint center to eye level
-      let estimatedEyeWorldY = headWorldPosition.y + estimatedEyeYOffset
-      
-      let heightDifference = cameraWorldPosition.y - estimatedEyeWorldY
-      let directionText: String
-      if abs(heightDifference) < 0.05 {
-        directionText = "Level with"
-      } else if heightDifference > 0 {
-        directionText = "Above"
-      } else {
-        directionText = "Below"
-      }
-      
-      let text = String(format: "Eyes: Cam %.2fm %@ Subject", abs(heightDifference), directionText)
-      DispatchQueue.main.async {
-        // Always update for fresh values
-        self.vm.cameraHeightRelativeToEyes = text
-      }
-    }
-
-    func calculateGeneralCameraHeight(cameraTransform: matrix_float4x4, frame: ARFrame) {
-        let cameraWorldY = cameraTransform.translation.y
-        var text: String
-        
-        // Simple approach - find the lowest horizontal plane (floor or table)
-        let floorPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
-            .filter { $0.alignment == .horizontal && ($0.classification == .floor || $0.classification == .table) }
-        
-        if let floorPlane = floorPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
-            let height = cameraWorldY - floorPlane.transform.translation.y
-            if height < -0.1 {
-                text = String(format: "Cam Height: %.2fm (Low?)", height)
-            } else {
-                text = String(format: "Cam Height: %.2fm (\(floorPlane.classification == .floor ? "Floor" : "Table"))", height)
-            }
-        } else {
-            // No classified floor/table, try any horizontal plane
-            let horizontalPlanes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
-                .filter { $0.alignment == .horizontal }
-            
-            if let anyHorizontalPlane = horizontalPlanes.min(by: { abs($0.transform.translation.y) < abs($1.transform.translation.y) }) {
-                let height = cameraWorldY - anyHorizontalPlane.transform.translation.y
-                if height < -0.1 {
-                    text = String(format: "Cam Height: %.2fm (Plane - Low?)", height)
-                } else {
-                    text = String(format: "Cam Height: %.2fm (Plane)", height)
-                }
-            } else {
-                // No planes detected, height relative to origin
-                text = String(format: "Cam Height: %.2fm (Origin)", cameraWorldY)
-            }
-        }
-        
-        DispatchQueue.main.async {
-            // Always update to ensure fresh values
-            self.vm.generalCameraHeight = text
-        }
-    }
-
-    func determineVisibleBodyParts(bodyAnchor: ARBodyAnchor, frame: ARFrame) {
-      guard let arView = self.arView else { DispatchQueue.main.async { self.vm.visibleBodyPartsInfo = "Visible Parts: ARView N/A" }; return }
-      var visibleJointsDescriptions: [String] = []
-      let jointsOfInterest: [ARKit.ARSkeleton.JointName] = [.head, .leftShoulder, .leftHand, .rightShoulder, .rightHand, .leftFoot, .rightFoot, .root] // .root is hip/pelvis area
-      for jointName in jointsOfInterest {
-        guard let jointModelTransform = bodyAnchor.skeleton.modelTransform(for: jointName) else { continue }
-        let jointWorldPosition = (bodyAnchor.transform * jointModelTransform).translation
-        
-        // Project point to screen space
-        if let screenPoint = arView.project(jointWorldPosition) {
-          // Check if point is in front of camera (z < 0 in camera space) and within screen bounds
-          let pointInCameraSpace = frame.camera.transform.inverse * SIMD4<Float>(jointWorldPosition.x, jointWorldPosition.y, jointWorldPosition.z, 1.0)
-          if pointInCameraSpace.z < 0 && // Point is in front of the camera
-             screenPoint.x >= arView.bounds.minX && screenPoint.x <= arView.bounds.maxX &&
-             screenPoint.y >= arView.bounds.minY && screenPoint.y <= arView.bounds.maxY { // Point is within screen bounds
-            visibleJointsDescriptions.append(jointName.rawValue.replacingOccurrences(of: "_joint", with: "").replacingOccurrences(of: "_", with: " ").capitalizedFirst())
-          }
-        }
-      }
-      let text = !visibleJointsDescriptions.isEmpty ? "Visible: " + visibleJointsDescriptions.prefix(5).joined(separator: ", ") + (visibleJointsDescriptions.count > 5 ? "..." : "") : (vm.detectedSubjectCount > 0 ? "Visible Parts: Subject Occluded/Out of View" : "Visible Parts: N/A")
-      DispatchQueue.main.async {
-        // Always update for fresh values
-        self.vm.visibleBodyPartsInfo = text
-      }
-    }
-
-    func session(_ session: ARSession, didFailWithError error: Error) {
-      print("❌ AR Session Failed: \(error.localizedDescription)")
-      DispatchQueue.main.async { self.vm.bodyTrackingHint = "AR Session Failed: \(error.localizedDescription.prefix(50))" }
-    }
-    func sessionWasInterrupted(_ session: ARSession) {
-      print("⏸️ AR Session Interrupted")
-      DispatchQueue.main.async { self.vm.bodyTrackingHint = "AR Session Interrupted. Trying to resume..." }
-    }
-    func sessionInterruptionEnded(_ session: ARSession) {
-      print("▶️ AR Session Interruption Ended. Resetting session.")
-      if let configuration = session.configuration {
-        session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
-        DispatchQueue.main.async {
-          self.vm.bodyTrackingHint = self.vm.isBodyTrackingActive ? "Body Tracking Active" : "World Tracking Active"
-          self.vm.distanceToPerson = "Looking for subjects..."
-          self.fetchInitialCameraFOV() // Re-fetch FOV as session restarted
-        }
-      } else { DispatchQueue.main.async { self.vm.bodyTrackingHint = "Session resumed, but config lost." } }
-    }
-    
-    // Enhanced subject detection combining ARKit and Vision
-    private func updateSubjectDetection(frame: ARFrame) {
-        // Get ARKit body tracking bounds if available  
-        var arSubjectBounds: SubjectBounds? = nil
-        if let bodyAnchor = currentBodyAnchor, validateHumanBody(bodyAnchor) {
-            arSubjectBounds = SubjectDetectionService.shared.calculateARSubjectBounds(from: bodyAnchor)
-        } else if currentBodyAnchor != nil {
-            // Clear invalid body anchor
-            currentBodyAnchor = nil
-            print("Cleared invalid body anchor in updateSubjectDetection")
-        }
-        
-        // Perform Vision-based detection (throttled to avoid performance issues)
-        if frame.timestamp.truncatingRemainder(dividingBy: 0.5) < 0.1 { // Run every ~0.5 seconds
-            SubjectDetectionService.shared.detectHumanSubjects(
-                in: frame.capturedImage,
-                cameraTransform: frame.camera.transform
-            ) { [weak self] visionBounds in
-                guard let self = self else { return }
-                
-                // Combine ARKit and Vision data
-                let hybridBounds = SubjectDetectionService.shared.hybridSubjectDetection(
-                    arBounds: arSubjectBounds,
-                    visionBounds: visionBounds
-                )
-                
-                DispatchQueue.main.async {
-                    self.vm.currentSubjectBounds = hybridBounds
-                    
-                    // Update guidance box if active and subject moved significantly
-                    if let bounds = hybridBounds,
-                       let activeGuidance = self.vm.activeGuidanceBox,
-                       self.vm.isGuidanceActive {
-                        
-                        // Check if subject moved significantly (>10cm)
-                        let movement = simd_distance(bounds.center, activeGuidance.targetPosition)
-                        if movement > 0.1, let guidance = self.vm.latestStructuredGuidance {
-                            // Update guidance box position
-                            self.vm.activateGuidanceBox(for: guidance, subjectBounds: bounds)
-                        }
-                    }
-                }
-            }
-        } else if let arBounds = arSubjectBounds {
-            // Update with ARKit-only data when not running Vision
-            DispatchQueue.main.async {
-                self.vm.currentSubjectBounds = arBounds
-            }
-        }
-    }
-    
-    private func syncBoxes(_ boxes: [PlacedBox]) { /* ... (Existing box syncing logic can be added here) ... */ }
-  }
-}
 
 // MARK: - Potential File: Extensions/String+Helpers.swift
 extension String { func capitalizedFirst() -> String { prefix(1).capitalized + dropFirst() } }
@@ -1621,7 +360,20 @@ struct DirectionAdjustment: Codable {
     let direction: String    // e.g., "left", "right", "up", "down", "forward", "back", "clockwise", "counter-clockwise", "no change"
     let magnitude: Double?   // Value in meters for translation or degrees for rotation
     let unit: String        // "m" for meters, "deg" for degrees
-    let description: String // Human-readable description
+}
+
+extension DirectionAdjustment {
+    var description: String {
+        if direction.lowercased() == "no change" {
+            return "No change"
+        }
+        
+        guard let magnitude = magnitude, magnitude > 0 else {
+            return "No change"
+        }
+        
+        return "\(direction) \(String(format: "%.1f", magnitude))\(unit)"
+    }
 }
 
 struct StructuredGeminiResponse: Codable {
@@ -1726,15 +478,15 @@ class SubjectDetectionService {
         let maxZ = jointPositions.max(by: { $0.z < $1.z })?.z ?? 0
         
         // Add padding for human body volume (adaptive based on detected joints)
-        let paddingFactor: Float = 0.4 // 40% padding to account for body volume beyond joints
+        let paddingFactor: Float = 0.15 // 15% padding to account for body volume beyond joints
         let width = (maxX - minX) * (1 + paddingFactor)
         let height = (maxY - minY) * (1 + paddingFactor)
         let depth = (maxZ - minZ) * (1 + paddingFactor)
         
         // Ensure minimum realistic human dimensions
-        let minWidth: Float = 0.5  // 50cm minimum width
-        let minHeight: Float = 1.4 // 140cm minimum height
-        let minDepth: Float = 0.4  // 40cm minimum depth
+        let minWidth: Float = 0.3  // 30cm minimum width
+        let minHeight: Float = 0.8 // 80cm minimum height (for seated persons)
+        let minDepth: Float = 0.3  // 30cm minimum depth
         
         let finalWidth = max(width, minWidth)
         let finalHeight = max(height, minHeight)
@@ -1896,33 +648,31 @@ class GuidanceBoxService {
         let cameraForward = -SIMD3<Float>(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
         let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
         
-        // Start with subject position as the center of our framing
-        var targetPosition = currentSubjectBounds.center
+        // The guidance box should show where the subject SHOULD BE in the world
+        // based on the AI recommendations. The user then moves their camera
+        // to align the real subject with this target position.
         
-        // Calculate current distance from camera to subject
+        var targetSubjectPosition = currentSubjectBounds.center
         let currentDistance = simd_length(currentSubjectBounds.center - cameraPosition)
+        var targetDistance = currentDistance
         
-        // Apply LLM recommendations to find ideal camera position
-        // Then place box at subject position as seen from that ideal viewpoint
+        // Process AI recommendations - these tell us how the CAMERA should move
+        // So we invert them to show where the subject should appear
         let translation = recommendations.translation
         
-        // Calculate where the camera should ideally be
-        var idealCameraOffset = SIMD3<Float>(0, 0, 0)
-        
-        // X-axis (left/right camera movement)
+        // X-axis: If camera should move right, subject appears left in frame
         if let xMagnitude = translation.x.magnitude, xMagnitude > 0 {
-            let direction: Float = translation.x.direction == "right" ? 1.0 : -1.0
-            idealCameraOffset += cameraRight * Float(xMagnitude) * direction
+            let direction: Float = translation.x.direction == "right" ? -1.0 : 1.0
+            targetSubjectPosition += cameraRight * Float(xMagnitude) * direction
         }
         
-        // Y-axis (up/down camera movement)
+        // Y-axis: If camera should move up, subject appears lower in frame
         if let yMagnitude = translation.y.magnitude, yMagnitude > 0 {
-            let direction: Float = translation.y.direction == "up" ? 1.0 : -1.0
-            idealCameraOffset += cameraUp * Float(yMagnitude) * direction
+            let direction: Float = translation.y.direction == "up" ? -1.0 : 1.0
+            targetSubjectPosition += cameraUp * Float(yMagnitude) * direction
         }
         
-        // Z-axis (forward/back camera movement)
-        var targetDistance = currentDistance
+        // Z-axis: Adjust target distance
         if let zMagnitude = translation.z.magnitude, zMagnitude > 0 {
             if translation.z.direction == "forward" {
                 targetDistance -= Float(zMagnitude)
@@ -1931,12 +681,7 @@ class GuidanceBoxService {
             }
         }
         
-        // Adjust the framing box position to show where the subject should appear
-        // in the frame when camera is at the ideal position
-        // This creates a "window" showing the target composition
-        targetPosition -= idealCameraOffset * 0.5  // Partial offset to guide without obscuring
-        
-        return (targetPosition, targetDistance)
+        return (targetSubjectPosition, targetDistance)
     }
     
     // Create guidance box that frames the subject optimally
@@ -1948,59 +693,57 @@ class GuidanceBoxService {
         cameraTransform: simd_float4x4
     ) -> GuidanceBox {
         
-        // Calculate framing size based on subject and framing guidance
-        let aspectRatio: Float = 16.0 / 9.0
+        // Get camera intrinsics for proper framing calculation
+        let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+        
+        // Calculate the frame size based on how the subject should appear in camera view
+        // This represents the "window" through which we want to see the subject
+        
+        // Start with the actual subject size
+        let subjectWidth = subjectBounds.size.x
         let subjectHeight = subjectBounds.size.y
         
-        // Determine frame size based on framing type and ideal subject percentage
-        var marginFactor: Float = 1.4  // Default 40% margin
+        // Determine desired framing based on AI recommendations
+        var framingMultiplier: Float = 1.5  // Default: subject fills 67% of frame
         
-        // Use framing guidance if available
         if let framing = recommendations.framing {
-            // Adjust margin based on framing type
+            // Adjust based on framing type
             switch framing.framing_type {
             case "close_up":
-                marginFactor = 1.2  // 20% margin for close-ups
+                framingMultiplier = 1.1  // Subject fills 91% of frame
             case "medium_shot":
-                marginFactor = 1.5  // 50% margin for medium shots
+                framingMultiplier = 1.5  // Subject fills 67% of frame
             case "full_body":
-                marginFactor = 1.8  // 80% margin for full body
+                framingMultiplier = 2.0  // Subject fills 50% of frame
             case "environmental":
-                marginFactor = 2.5  // 150% margin for environmental shots
+                framingMultiplier = 3.0  // Subject fills 33% of frame
             default:
-                marginFactor = 1.4
+                framingMultiplier = 1.5
             }
             
-            // Use ideal_subject_percentage if provided
+            // Override with specific percentage if provided
             if let idealPercentage = framing.ideal_subject_percentage, idealPercentage > 0 {
-                // Calculate frame size so subject fills the ideal percentage
-                marginFactor = 1.0 / Float(idealPercentage)
+                framingMultiplier = 1.0 / Float(idealPercentage)
             }
         }
         
-        // Calculate frame dimensions
-        let frameHeight = subjectHeight * marginFactor
-        let frameWidth = frameHeight * aspectRatio
+        // Calculate the guidance frame size
+        // This represents how big the framing window should be
+        let frameHeight = subjectHeight * framingMultiplier
+        let frameWidth = subjectWidth * framingMultiplier * 1.5  // Wider aspect for better composition
         
-        // Apply distance-based scaling for perspective
-        let distanceFactor = targetDistance / 3.0  // Normalize to 3m reference
-        let scaledHeight = frameHeight * min(max(distanceFactor, 0.5), 2.0)
-        let scaledWidth = frameWidth * min(max(distanceFactor, 0.5), 2.0)
-        
+        // The frame size should NOT change with distance - it represents
+        // the desired framing, not a physical object
         let finalSize = SIMD3<Float>(
-            scaledWidth,
-            scaledHeight,
-            0.05  // Thin frame depth
+            frameWidth,
+            frameHeight,
+            0.02  // Very thin frame
         )
-        
-        // Calculate relative offset from camera to box
-        let cameraPosition = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
-        let relativeOffset = targetPosition - cameraPosition
         
         return GuidanceBox(
             id: UUID(),
             targetPosition: targetPosition,
-            subjectRelativeOffset: relativeOffset,
+            subjectRelativeOffset: targetPosition - subjectBounds.center,
             size: finalSize,
             confidence: subjectBounds.confidence,
             isActive: true,
@@ -2363,341 +1106,22 @@ class GuidanceBoxRenderer {
     }
 }
 
-// MARK: - Potential File: Services/APIService.swift
-class APIService {
-  static let shared = APIService()
-  private var analysisApiKey: String = ""
-  private var analysisApiURL: String = ""
-  
-  private var flashApiKey: String = ""
-  private var flashApiURLString: String = ""
-
-  func configure(apiKey: String, apiURL: String) {
-    self.analysisApiKey = apiKey
-    self.analysisApiURL = apiURL
-    print("APIService (Analysis) configured. URL: \(apiURL.isEmpty ? "Not Set" : apiURL), Key: \(apiKey.isEmpty ? "Not Set" : "Set")")
-  }
-   
-    func configureFlash(apiKey: String, apiURL: String) {
-       self.flashApiKey = apiKey
-       if apiKey.isEmpty {
-           self.flashApiURLString = apiURL
-            print("APIService (Flash Gen) configured. API Key IS EMPTY. URL: \(apiURL)")
-       } else if apiURL.contains("?key=") || apiURL.contains("&key=") {
-           self.flashApiURLString = apiURL
-           print("APIService (Flash Gen) configured. URL (already has key): \(apiURL)")
-       } else {
-           // CORRECTED SECTION TO AVOID OVERLAPPING ACCESS
-           if var components = URLComponents(string: apiURL) { // Make components mutable
-               var currentQueryItems = components.queryItems ?? []
-               currentQueryItems.append(URLQueryItem(name: "key", value: apiKey))
-               components.queryItems = currentQueryItems
-               
-               if let urlWithKey = components.url?.absoluteString {
-                   self.flashApiURLString = urlWithKey
-                   print("APIService (Flash Gen) configured. URL (appended key): \(self.flashApiURLString)")
-               } else {
-                   self.flashApiURLString = apiURL // Fallback if URL construction fails after modification
-                   print("APIService (Flash Gen) configured. API Key provided, but FAILED to construct final URL. Using original URL: \(apiURL)")
-               }
-           } else {
-               self.flashApiURLString = apiURL // Fallback if initial URLComponents creation fails
-               print("APIService (Flash Gen) configured. API Key provided, but FAILED to parse initial URL. Using original URL: \(apiURL)")
-           }
-       }
-     }
-   
-  func sendAnalysis(image: UIImage, metrics: [String: String]) async throws -> String {
-    guard !analysisApiKey.isEmpty, !analysisApiURL.isEmpty else {
-      print("Analysis API (separate) not configured. If using Gemini for analysis, ensure its prompt is set correctly elsewhere.")
-      throw NSError(domain: "APIService.Analysis", code: 1, userInfo: [NSLocalizedDescriptionKey: "Analysis API (separate) not configured."])
-    }
-    guard let url = URL(string: analysisApiURL) else { throw NSError(domain: "APIService.Analysis", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid Analysis API URL."]) }
-    guard let imageData = image.jpegData(compressionQuality: 0.8) else { throw NSError(domain: "APIService.Analysis", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to convert image."]) }
-    let requestBody: [String: Any] = ["image": imageData.base64EncodedString(), "metrics": metrics]
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("Bearer \(analysisApiKey)", forHTTPHeaderField: "Authorization")
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
-        let errorDetail = String(data: data, encoding: .utf8) ?? "No error details"
-        throw NSError(domain: "APIService.Analysis", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid response. Status: \((response as? HTTPURLResponse)?.statusCode ?? -1). Detail: \(errorDetail)"])
-    }
-    guard let responseString = String(data: data, encoding: .utf8) else { throw NSError(domain: "APIService.Analysis", code: 5, userInfo: [NSLocalizedDescriptionKey: "Invalid response data."]) }
-    return responseString
-  }
-
-  func generateTextWithGeminiFlash(prompt: String) async throws -> String {
-    guard !flashApiURLString.isEmpty else {
-        throw NSError(domain: "APIService.GeminiText", code: 201, userInfo: [NSLocalizedDescriptionKey: "Gemini Text API URL not configured."])
-    }
-    guard let url = URL(string: flashApiURLString) else {
-        throw NSError(domain: "APIService.GeminiText", code: 203, userInfo: [NSLocalizedDescriptionKey: "Invalid Gemini Text API URL: \(flashApiURLString)"])
-    }
-    let requestBody: [String: Any] = [
-        "contents": [
-            ["parts": [["text": prompt]]]
-        ],
-        "generationConfig": [
-            "thinkingConfig": [
-                "thinkingBudget": 0
-            ]
-        ]
-    ]
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-    print("Sending text generation request to Gemini: \(url.absoluteString)")
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let httpResponse = response as? HTTPURLResponse else { throw NSError(domain: "APIService.GeminiText", code: 204, userInfo: [NSLocalizedDescriptionKey: "Invalid response object."]) }
-    print("Gemini Text API Status Code: \(httpResponse.statusCode)")
-    guard (200...299).contains(httpResponse.statusCode) else {
-        let errorDetail = String(data: data, encoding: .utf8) ?? "No details"
-        print("Gemini Text API Error (\(httpResponse.statusCode)): \(errorDetail)")
-        throw NSError(domain: "APIService.GeminiText", code: 205, userInfo: [NSLocalizedDescriptionKey: "Gemini Text API error. Status: \(httpResponse.statusCode). Details: \(errorDetail.prefix(200))"])
-    }
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = json["candidates"] as? [[String: Any]],
-              let firstCandidate = candidates.first,
-              let content = firstCandidate["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]],
-              let firstPart = parts.first,
-              let text = firstPart["text"] as? String else {
-            let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
-            print("Could not parse text from Gemini response. Raw: \(rawResponse.prefix(500))")
-            throw NSError(domain: "APIService.GeminiText", code: 206, userInfo: [NSLocalizedDescriptionKey: "Could not parse text. Raw: \(rawResponse.prefix(500))"])
-        }
-        return text
-    } catch {
-        let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
-        print("Failed to decode Gemini text response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))")
-        throw NSError(domain: "APIService.GeminiText", code: 207, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))"])
-    }
-  }
-
-  func sendImageGenerationRequest(referenceImage: UIImage, currentImage: UIImage, prompt: String, additionalMetrics: [String: String]?) async throws -> (String, UIImage?) {
-    guard !flashApiURLString.isEmpty else {
-        throw NSError(domain: "APIService.FlashGen", code: 101, userInfo: [NSLocalizedDescriptionKey: "Flash 2.0 API URL not configured."])
-    }
-    guard let url = URL(string: flashApiURLString) else {
-        throw NSError(domain: "APIService.FlashGen", code: 103, userInfo: [NSLocalizedDescriptionKey: "Invalid Flash 2.0 API URL: \(flashApiURLString)"])
-    }
-    guard let refImageData = referenceImage.jpegData(compressionQuality: 0.85),
-          let currentImageData = currentImage.jpegData(compressionQuality: 0.8) else {
-        throw NSError(domain: "APIService.FlashGen", code: 102, userInfo: [NSLocalizedDescriptionKey: "Failed to convert images to JPEG."])
-    }
-    let base64RefImage = refImageData.base64EncodedString()
-    let base64CurrentImage = currentImageData.base64EncodedString()
-    
-    var partsArray: [[String: Any]] = [
-        ["text": prompt],
-        ["inline_data": ["mime_type": "image/jpeg", "data": base64RefImage]],
-        ["inline_data": ["mime_type": "image/jpeg", "data": base64CurrentImage]]
-    ]
-    
-    let requestPayload: [String: Any] = [
-        "contents": [["parts": partsArray]]
-    ]
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestPayload)
-    print("Sending multimodal request to Flash Gen API: \(url.absoluteString). Prompt length: \(prompt.count) chars. Ref Img: \(base64RefImage.count/1024)KB, Cur Img: \(base64CurrentImage.count/1024)KB")
-    
-    let (data, response) = try await URLSession.shared.data(for: request)
-    
-    guard let httpResponse = response as? HTTPURLResponse else {
-        throw NSError(domain: "APIService.FlashGen", code: 104, userInfo: [NSLocalizedDescriptionKey: "Invalid response object."])
-    }
-    print("Flash Gen API (Multimodal) Status Code: \(httpResponse.statusCode)")
-    
-    guard (200...299).contains(httpResponse.statusCode) else {
-        let errorDetail = String(data: data, encoding: .utf8) ?? "No details"
-        print("Flash API Error (\(httpResponse.statusCode)): \(errorDetail)")
-        throw NSError(domain: "APIService.FlashGen", code: 105, userInfo: [NSLocalizedDescriptionKey: "Flash API error. Status: \(httpResponse.statusCode). Details: \(errorDetail.prefix(500))"])
-    }
-    
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "APIService.FlashGen", code: 107, userInfo: [NSLocalizedDescriptionKey: "Response not valid JSON."])
-        }
-        
-        var directivesText = "Error: No text part found in Gemini response."
-        if let candidates = json["candidates"] as? [[String: Any]],
-           let firstCandidate = candidates.first,
-           let content = firstCandidate["content"] as? [String: Any],
-           let parts = content["parts"] as? [[String: Any]] {
-            for part in parts {
-                if let text = part["text"] as? String {
-                    directivesText = text
-                    break
-                }
-            }
-        } else {
-             let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
-             print("Could not parse 'candidates' or 'parts' from Gemini response. Raw: \(rawResponse.prefix(500))")
-             directivesText = "Error: Could not parse full response structure. Check logs."
-        }
-        print("Parsed response from Flash Gen API. Directives: \(directivesText.prefix(100))...")
-        return (directivesText, nil)
-    } catch {
-        let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
-        print("Failed to decode Flash Gen response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))")
-        throw NSError(domain: "APIService.FlashGen", code: 106, userInfo: [NSLocalizedDescriptionKey: "Failed to decode response: \(error.localizedDescription). Raw: \(rawResponse.prefix(500))"])
-    }
-  }
-  
-  func sendStructuredImageComparisonRequest(referenceImage: UIImage, currentImage: UIImage, prompt: String, additionalMetrics: [String: String]?) async throws -> (StructuredGeminiResponse, String) {
-    guard !flashApiURLString.isEmpty else {
-        throw NSError(domain: "APIService.FlashGen", code: 101, userInfo: [NSLocalizedDescriptionKey: "Flash 2.0 API URL not configured."])
-    }
-    guard let url = URL(string: flashApiURLString) else {
-        throw NSError(domain: "APIService.FlashGen", code: 103, userInfo: [NSLocalizedDescriptionKey: "Invalid Flash 2.0 API URL: \(flashApiURLString)"])
-    }
-    guard let refImageData = referenceImage.jpegData(compressionQuality: 0.85),
-          let currentImageData = currentImage.jpegData(compressionQuality: 0.8) else {
-        throw NSError(domain: "APIService.FlashGen", code: 102, userInfo: [NSLocalizedDescriptionKey: "Failed to convert images to JPEG."])
-    }
-    let base64RefImage = refImageData.base64EncodedString()
-    let base64CurrentImage = currentImageData.base64EncodedString()
-    
-    var partsArray: [[String: Any]] = [
-        ["text": prompt],
-        ["inline_data": ["mime_type": "image/jpeg", "data": base64RefImage]],
-        ["inline_data": ["mime_type": "image/jpeg", "data": base64CurrentImage]]
-    ]
-    
-    let requestPayload: [String: Any] = [
-        "contents": [["parts": partsArray]]
-    ]
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestPayload)
-    print("Sending structured multimodal request to Flash Gen API: \(url.absoluteString). Prompt length: \(prompt.count) chars. Ref Img: \(base64RefImage.count/1024)KB, Cur Img: \(base64CurrentImage.count/1024)KB")
-    
-    let (data, response) = try await URLSession.shared.data(for: request)
-    
-    guard let httpResponse = response as? HTTPURLResponse else {
-        throw NSError(domain: "APIService.FlashGen", code: 104, userInfo: [NSLocalizedDescriptionKey: "Invalid response object."])
-    }
-    print("Flash Gen API (Structured) Status Code: \(httpResponse.statusCode)")
-    
-    guard (200...299).contains(httpResponse.statusCode) else {
-        let errorDetail = String(data: data, encoding: .utf8) ?? "No details"
-        print("Flash API Error (\(httpResponse.statusCode)): \(errorDetail)")
-        throw NSError(domain: "APIService.FlashGen", code: 105, userInfo: [NSLocalizedDescriptionKey: "Flash API error. Status: \(httpResponse.statusCode). Details: \(errorDetail.prefix(500))"])
-    }
-    
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = json["candidates"] as? [[String: Any]],
-              let firstCandidate = candidates.first,
-              let content = firstCandidate["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            throw NSError(domain: "APIService.FlashGen", code: 107, userInfo: [NSLocalizedDescriptionKey: "Response not valid JSON structure."])
-        }
-        
-        var jsonResponseText = ""
-        for part in parts {
-            if let text = part["text"] as? String {
-                jsonResponseText = text
-                break
-            }
-        }
-        
-        // Clean the response text (remove any markdown formatting if present)
-        let cleanedJSON = jsonResponseText
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "```json", with: "")
-            .replacingOccurrences(of: "```", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // Parse the JSON response into our structured model
-        guard let jsonData = cleanedJSON.data(using: .utf8) else {
-            throw NSError(domain: "APIService.FlashGen", code: 108, userInfo: [NSLocalizedDescriptionKey: "Failed to convert response text to data."])
-        }
-        
-        let structuredResponse = try JSONDecoder().decode(StructuredGeminiResponse.self, from: jsonData)
-        
-        print("Successfully parsed structured response from Gemini")
-        return (structuredResponse, jsonResponseText)
-        
-    } catch let decodingError as DecodingError {
-        let rawResponse = String(data: data, encoding: .utf8) ?? "No raw data"
-        print("Failed to decode structured response: \(decodingError). Raw: \(rawResponse.prefix(500))")
-        throw NSError(domain: "APIService.FlashGen", code: 109, userInfo: [NSLocalizedDescriptionKey: "Failed to decode structured response: \(decodingError.localizedDescription)"])
-    } catch {
-        throw error
-    }
-  }
-}
 
 // MARK: - Guidance Overlay View
 struct GuidanceOverlay: View {
     @ObservedObject var viewModel: ARViewModel
     
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                // Subject bounding box
-                if viewModel.isGuidanceActive && viewModel.guidanceSubjectScreenBounds != .zero {
-                    // Draw the subject highlight box with rounded corners
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(lineWidth: 4)
-                        .foregroundColor(colorForAlignment(viewModel.guidanceAlignmentScore))
-                        .frame(width: viewModel.guidanceSubjectScreenBounds.width,
-                               height: viewModel.guidanceSubjectScreenBounds.height)
-                        .position(x: viewModel.guidanceSubjectScreenBounds.midX,
-                                  y: viewModel.guidanceSubjectScreenBounds.midY)
-                        .shadow(color: .black.opacity(0.3), radius: 2)
-                    
-                    // Corner indicators for better visibility
-                    let corners = [
-                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.minX, y: viewModel.guidanceSubjectScreenBounds.minY),
-                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.maxX, y: viewModel.guidanceSubjectScreenBounds.minY),
-                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.maxX, y: viewModel.guidanceSubjectScreenBounds.maxY),
-                        CGPoint(x: viewModel.guidanceSubjectScreenBounds.minX, y: viewModel.guidanceSubjectScreenBounds.maxY)
-                    ]
-                    
-                    ForEach(0..<4) { index in
-                        Circle()
-                            .fill(colorForAlignment(viewModel.guidanceAlignmentScore))
-                            .frame(width: 12, height: 12)
-                            .position(corners[index])
-                            .shadow(radius: 2)
-                    }
-                    
-                    // Directional indicators
-                    DirectionalArrows(directions: viewModel.guidanceDirections,
-                                      screenSize: geometry.size,
-                                      subjectBounds: viewModel.guidanceSubjectScreenBounds)
-                    
-                    // Ideal framing guide (semi-transparent)
-                    if let _ = viewModel.activeGuidanceBox {
-                        IdealFramingGuide(viewModel: viewModel, screenSize: geometry.size)
-                    }
-                }
-            }
-        }
-        .allowsHitTesting(false)  // Don't block touch events
-    }
-    
-    func colorForAlignment(_ score: Float) -> Color {
-        if score < 0.3 {
-            return .red
-        } else if score < 0.7 {
-            return .yellow
-        } else {
-            return .green
-        }
+        // Use the new Apple-style alignment view
+        AppleStyleAlignmentView(viewModel: viewModel)
+            .allowsHitTesting(false)  // Don't block touch events
     }
 }
 
 struct DirectionalArrows: View {
     let directions: GuidanceDirections
     let screenSize: CGSize
-    let subjectBounds: CGRect
+    let targetBounds: CGRect
     
     var body: some View {
         ZStack {
@@ -2725,11 +1149,11 @@ struct DirectionalArrows: View {
                     .position(x: screenSize.width / 2, y: screenSize.height - 100)
             }
             
-            // Forward/Back indicators positioned below subject
+            // Forward/Back indicators positioned below target box
             if directions.moveForward > 0.1 || directions.moveBack > 0.1 {
                 DistanceIndicator(forward: directions.moveForward, back: directions.moveBack)
                     .position(x: screenSize.width / 2, 
-                              y: min(subjectBounds.maxY + 80, screenSize.height - 150))
+                              y: min(targetBounds.maxY + 80, screenSize.height - 150))
             }
             
             // Rotation indicators (turn left/right)
@@ -2873,57 +1297,6 @@ struct RotationIndicator: View {
     }
 }
 
-struct IdealFramingGuide: View {
-    @ObservedObject var viewModel: ARViewModel
-    let screenSize: CGSize
-    
-    var body: some View {
-        // Only show when alignment is poor
-        if viewModel.guidanceAlignmentScore < 0.8 {
-            ZStack {
-                // Target zone indicator
-                Text("Move subject here")
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.green.opacity(0.8)))
-                    .position(x: screenSize.width / 2, y: screenSize.height / 2 - calculateIdealFrameSize().height / 2 - 30)
-                    .shadow(radius: 3)
-                
-                // Main frame with animated pulse
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(style: StrokeStyle(lineWidth: 3, dash: [15, 10]))
-                    .foregroundColor(.green.opacity(0.6))
-                    .frame(width: calculateIdealFrameSize().width,
-                           height: calculateIdealFrameSize().height)
-                    .position(x: screenSize.width / 2, y: screenSize.height / 2)
-                    .scaleEffect(1.0 + (sin(Date().timeIntervalSince1970 * 2) * 0.02))
-                
-                // Rule of thirds guides (subtle)
-                RuleOfThirdsGuides(frameSize: calculateIdealFrameSize())
-                    .position(x: screenSize.width / 2, y: screenSize.height / 2)
-                    .opacity(0.3)
-            }
-        }
-    }
-    
-    func calculateIdealFrameSize() -> CGSize {
-        // Calculate based on current subject bounds and ideal framing
-        if viewModel.guidanceSubjectScreenBounds != .zero {
-            // Use subject-based sizing with margin
-            let margin: CGFloat = 1.5  // 50% margin around subject
-            return CGSize(width: viewModel.guidanceSubjectScreenBounds.width * margin,
-                          height: viewModel.guidanceSubjectScreenBounds.height * margin)
-        } else {
-            // Fallback to screen-based sizing
-            let baseWidth = screenSize.width * 0.7
-            let baseHeight = baseWidth / (16.0 / 9.0)
-            return CGSize(width: baseWidth, height: min(baseHeight, screenSize.height * 0.6))
-        }
-    }
-}
 
 struct RuleOfThirdsGuides: View {
     let frameSize: CGSize
@@ -2947,6 +1320,36 @@ struct RuleOfThirdsGuides: View {
                     .position(x: frameSize.width / 2,
                               y: frameSize.height * CGFloat(index) / 3.0)
             }
+        }
+    }
+}
+
+struct SubjectPositionIndicator: View {
+    let subjectBounds: CGRect
+    let isAligned: Bool
+    
+    var body: some View {
+        // Semi-transparent overlay showing current subject position
+        RoundedRectangle(cornerRadius: 12)
+            .stroke(style: StrokeStyle(lineWidth: 2, dash: isAligned ? [] : [8, 4]))
+            .foregroundColor(isAligned ? .green.opacity(0.5) : .white.opacity(0.5))
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(isAligned ? Color.green.opacity(0.1) : Color.clear)
+            )
+            .frame(width: subjectBounds.width, height: subjectBounds.height)
+            .position(x: subjectBounds.midX, y: subjectBounds.midY)
+            .animation(.easeInOut(duration: 0.3), value: isAligned)
+        
+        if !isAligned {
+            Text("Current Position")
+                .font(.caption2)
+                .fontWeight(.medium)
+                .foregroundColor(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.black.opacity(0.6)))
+                .position(x: subjectBounds.midX, y: subjectBounds.minY - 20)
         }
     }
 }

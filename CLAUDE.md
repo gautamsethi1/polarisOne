@@ -27,7 +27,7 @@ polarisOne is an iOS ARKit application that serves as an intelligent AR photogra
 ## Architecture
 
 ### Current Structure
-The app is currently implemented in a single file (`polarisOne/ARKitCameraApp.swift`) but is architecturally organized as:
+The app is currently implemented in a multiple files (`polarisOne/ARKitCameraApp.swift`) but is architecturally organized as:
 - **MVVM Pattern**: ObservableObject ViewModels manage state
 - **ARViewModel**: Central coordinator for ARKit session, tracking, and measurements
 - **APIService**: Handles Gemini API integration
